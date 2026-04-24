@@ -27,6 +27,7 @@ func NewFromConfig(cfg *config.Config) (Embedder, error) {
 			WithOpenAIKey(cfg.Embedder.APIKey),
 			WithOpenAIEndpoint(cfg.Embedder.Endpoint),
 			WithOpenAIParallelism(cfg.Embedder.Parallelism),
+			WithOpenAIBatchConfig(batchConfigFromEmbedder(&cfg.Embedder)),
 		}
 		if cfg.Embedder.Dimensions != nil {
 			opts = append(opts, WithOpenAIDimensions(*cfg.Embedder.Dimensions))
@@ -54,6 +55,19 @@ func NewFromConfig(cfg *config.Config) (Embedder, error) {
 		}
 		return NewSyntheticEmbedder(opts...)
 
+	case "voyageai":
+		opts := []VoyageAIOption{
+			WithVoyageAIModel(cfg.Embedder.Model),
+			WithVoyageAIKey(cfg.Embedder.APIKey),
+			WithVoyageAIEndpoint(cfg.Embedder.Endpoint),
+			WithVoyageAIParallelism(cfg.Embedder.Parallelism),
+			WithVoyageAIBatchConfig(batchConfigFromEmbedder(&cfg.Embedder)),
+		}
+		if cfg.Embedder.Dimensions != nil {
+			opts = append(opts, WithVoyageAIDimensions(*cfg.Embedder.Dimensions))
+		}
+		return NewVoyageAIEmbedder(opts...)
+
 	case "openrouter":
 		opts := []OpenRouterOption{
 			WithOpenRouterModel(cfg.Embedder.Model),
@@ -78,4 +92,11 @@ func NewFromWorkspaceConfig(ws *config.Workspace) (Embedder, error) {
 		Embedder: ws.Embedder,
 	}
 	return NewFromConfig(cfg)
+}
+
+// batchConfigFromEmbedder derives a BatchConfig from the user-visible
+// EmbedderConfig. Zero values fall back to per-provider defaults.
+func batchConfigFromEmbedder(cfg *config.EmbedderConfig) BatchConfig {
+	size, tokens := cfg.ResolveBatchLimits()
+	return BatchConfig{MaxBatchSize: size, MaxBatchTokens: tokens}
 }

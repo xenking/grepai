@@ -80,6 +80,24 @@ type TraceResult struct {
 	Callers []CallerInfo `json:"callers,omitempty"`
 	Callees []CalleeInfo `json:"callees,omitempty"`
 	Graph   *CallGraph   `json:"graph,omitempty"`
+	// References surfaces value-passed usages of the target symbol —
+	// e.g. `go Fn()`, `ExecuteWorkflow(ctx, Fn, ...)`, `handlers["x"]
+	// = Fn`. Populated by the `trace callers` post-pass when direct
+	// call-sites are empty but identifier references exist; kept
+	// semantically distinct from Callers so downstream tooling
+	// doesn't lose the call-site vs ref distinction.
+	References []ReferenceInfo `json:"references,omitempty"`
+}
+
+// ReferenceInfo is an identifier-level reference to a symbol that is
+// NOT a direct call. Kind is always "value-ref" for now; new kinds
+// may be added as the scanner grows.
+type ReferenceInfo struct {
+	File      string `json:"file"`
+	Line      int    `json:"line"`
+	Enclosing string `json:"enclosing,omitempty"`
+	Snippet   string `json:"snippet"`
+	Kind      string `json:"kind"`
 }
 
 // CallerInfo represents a function that calls the target.

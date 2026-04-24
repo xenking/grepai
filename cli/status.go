@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -62,6 +63,11 @@ type model struct {
 	savingsSummary  *stats.Summary
 	savingsDays     []stats.DaySummary
 	savingsSelected int
+	// lastIndexed / lastActivity come from state.yaml and let
+	// `status` distinguish "last successful reindex" from "last
+	// observable watcher event" (delete, rename, chunk-skip).
+	lastIndexed  time.Time
+	lastActivity time.Time
 }
 
 func init() {
@@ -213,11 +219,17 @@ func (m model) viewStats() string {
 	sb.WriteString(normalStyle.Render("Index size:       "))
 	sb.WriteString(fmt.Sprintf("%s\n", formatBytes(m.stats.IndexSize)))
 
-	sb.WriteString(normalStyle.Render("Last updated:     "))
-	if m.stats.LastUpdated.IsZero() {
-		sb.WriteString("Never\n")
-	} else {
-		sb.WriteString(fmt.Sprintf("%s\n", m.stats.LastUpdated.Format("2006-01-02 15:04:05")))
+	lastActivity := resolveLastActivity(m.lastActivity, m.lastIndexed, m.stats.LastUpdated)
+	lastIndexed := resolveLastIndexed(m.lastIndexed, m.stats.LastUpdated)
+
+	sb.WriteString(normalStyle.Render("Last activity:    "))
+	sb.WriteString(formatStatusTimestamp(lastActivity) + "\n")
+	// Only show a separate "Last indexed" line when it differs from
+	// activity — otherwise the UI is just noisy. Keep prefix stable
+	// so scripts parsing stdout stay happy.
+	if !lastIndexed.Equal(lastActivity) {
+		sb.WriteString(normalStyle.Render("Last indexed:     "))
+		sb.WriteString(formatStatusTimestamp(lastIndexed) + "\n")
 	}
 
 	sb.WriteString(normalStyle.Render("Provider:         "))
@@ -498,8 +510,17 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	watchStatus := resolveWatcherRuntimeStatus(projectRoot)
 	useUI := shouldUseStatusUI(isInteractiveTerminal(), statusNoUI)
 
+	// Load runtime state so we can distinguish "last successful
+	// reindex" from "last observable watcher event". Missing state
+	// falls back to the store's chunk-mtime ceiling.
+	runtimeState, stateErr := config.LoadState(projectRoot)
+	if stateErr != nil {
+		// Non-fatal: status should always render something useful.
+		runtimeState = &config.State{}
+	}
+
 	if !useUI {
-		fmt.Print(renderStatusSummary(cfg, indexStats, watchStatus))
+		fmt.Print(renderStatusSummary(cfg, indexStats, watchStatus, runtimeState))
 		return nil
 	}
 
@@ -522,6 +543,8 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		worktreeID:     watchStatus.worktreeID,
 		savingsSummary: savingsSummary,
 		savingsDays:    savingsDays,
+		lastIndexed:    runtimeState.LastIndexTime,
+		lastActivity:   runtimeState.LastActivityTime,
 	}
 
 	// Run TUI
@@ -632,17 +655,25 @@ func resolveWatcherCandidateLogDirs(projectRoot string) ([]string, error) {
 	return logDirs, nil
 }
 
-func renderStatusSummary(cfg *config.Config, stats *store.IndexStats, watch watcherRuntimeStatus) string {
+func renderStatusSummary(cfg *config.Config, stats *store.IndexStats, watch watcherRuntimeStatus, st *config.State) string {
 	var sb strings.Builder
 	sb.WriteString("grepai index status\n")
 	sb.WriteString(fmt.Sprintf("Files indexed: %d\n", stats.TotalFiles))
 	sb.WriteString(fmt.Sprintf("Total chunks: %d\n", stats.TotalChunks))
 	sb.WriteString(fmt.Sprintf("Index size: %s\n", formatBytes(stats.IndexSize)))
-	if stats.LastUpdated.IsZero() {
-		sb.WriteString("Last updated: Never\n")
-	} else {
-		sb.WriteString(fmt.Sprintf("Last updated: %s\n", stats.LastUpdated.Format("2006-01-02 15:04:05")))
+
+	var stateIndex, stateActivity time.Time
+	if st != nil {
+		stateIndex = st.LastIndexTime
+		stateActivity = st.LastActivityTime
 	}
+	lastActivity := resolveLastActivity(stateActivity, stateIndex, stats.LastUpdated)
+	lastIndexed := resolveLastIndexed(stateIndex, stats.LastUpdated)
+	sb.WriteString(fmt.Sprintf("Last activity: %s\n", formatStatusTimestamp(lastActivity)))
+	if !lastIndexed.Equal(lastActivity) {
+		sb.WriteString(fmt.Sprintf("Last indexed: %s\n", formatStatusTimestamp(lastIndexed)))
+	}
+
 	sb.WriteString(fmt.Sprintf("Provider: %s (%s)\n", cfg.Embedder.Provider, cfg.Embedder.Model))
 	if watch.running {
 		sb.WriteString(fmt.Sprintf("Watcher: running (PID %d)\n", watch.pid))
@@ -653,6 +684,38 @@ func renderStatusSummary(cfg *config.Config, stats *store.IndexStats, watch watc
 		sb.WriteString(fmt.Sprintf("Watcher log: %s\n", watch.logFile))
 	}
 	return sb.String()
+}
+
+// resolveLastActivity picks the best "last observable event" timestamp
+// from the inputs. Prefers state.yaml's explicit last_activity_time,
+// falling back to last_index_time, then to the store's chunk mtime
+// ceiling so that legacy deployments still get a value.
+func resolveLastActivity(activity, index, fallback time.Time) time.Time {
+	if !activity.IsZero() {
+		return activity
+	}
+	if !index.IsZero() {
+		return index
+	}
+	return fallback
+}
+
+// resolveLastIndexed prefers state.yaml's last_index_time (the
+// authoritative "last successful reindex" timestamp) and falls back
+// to the chunk mtime ceiling computed from the store when state is
+// missing — e.g. for projects that never wrote state.yaml yet.
+func resolveLastIndexed(index, fallback time.Time) time.Time {
+	if !index.IsZero() {
+		return index
+	}
+	return fallback
+}
+
+func formatStatusTimestamp(t time.Time) string {
+	if t.IsZero() {
+		return "Never"
+	}
+	return t.Format("2006-01-02 15:04:05")
 }
 
 func loadStatusFiles(

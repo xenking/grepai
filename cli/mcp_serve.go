@@ -26,6 +26,9 @@ The server communicates via stdio and exposes the following tools:
   - grepai_refs_writers: Find property/state writers for a symbol name
   - grepai_refs_graph: Build a property usage graph (readers + writers)
   - grepai_index_status: Check index health and statistics (includes RPG stats when enabled)
+
+The following tools are only advertised when RPG is enabled in .grepai/config.yaml:
+
   - grepai_rpg_search: Search RPG graph nodes by feature semantics
   - grepai_rpg_fetch: Fetch hierarchy and edge context for a specific RPG node
   - grepai_rpg_explore: Traverse RPG graph neighborhoods with direction/depth filters
@@ -124,27 +127,31 @@ func resolveMCPTarget(explicitPath, workspaceName string) (string, string, error
 	}
 
 	wsName, ws, wsErr := config.FindWorkspaceForPath(cwd)
-	if wsErr != nil {
-		// If workspace config exists with at least one workspace, allow starting
-		// unscoped MCP server and let tools accept workspace at runtime.
-		cfg, cfgErr := config.LoadWorkspaceConfig()
-		if cfgErr == nil && cfg != nil && len(cfg.Workspaces) > 0 {
-			return "", "", nil
-		}
-		return "", "", fmt.Errorf("no grepai project or workspace found (run 'grepai init' or use --workspace)")
-	}
-	if ws != nil {
+	if wsErr == nil && ws != nil {
 		return "", wsName, nil
 	}
 
-	// No containing workspace for cwd, but still allow startup if global
-	// workspace config has entries (runtime workspace argument can be used).
-	cfg, cfgErr := config.LoadWorkspaceConfig()
-	if cfgErr == nil && cfg != nil && len(cfg.Workspaces) > 0 {
-		return "", "", nil
-	}
+	// No containing workspace for cwd, but still allow startup. MCP clients often
+	// configure servers globally and launch them from arbitrary working
+	// directories. Starting unscoped keeps tool discovery alive; tool calls that
+	// need project data return contextual guidance instead of making the client
+	// report a startup failure.
+	return "", "", nil
+}
 
-	return "", "", fmt.Errorf("no grepai project or workspace found (run 'grepai init' or use --workspace)")
+// resolveRPGEnabled reports whether the RPG feature is enabled for the given
+// project root. When projectRoot is empty (workspace-only mode without a local
+// project) or the config cannot be loaded, it returns false so that RPG tools
+// are not advertised.
+func resolveRPGEnabled(projectRoot string) bool {
+	if projectRoot == "" {
+		return false
+	}
+	cfg, err := config.Load(projectRoot)
+	if err != nil {
+		return false
+	}
+	return cfg.RPG.Enabled
 }
 
 func runMCPServe(cmd *cobra.Command, args []string) error {
@@ -160,11 +167,13 @@ func runMCPServe(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	rpgEnabled := resolveRPGEnabled(projectRoot)
+
 	var srv *mcp.Server
 	if wsName != "" {
-		srv, err = mcp.NewServerWithWorkspace(projectRoot, wsName)
+		srv, err = mcp.NewServerWithWorkspace(projectRoot, wsName, rpgEnabled)
 	} else {
-		srv, err = mcp.NewServer(projectRoot)
+		srv, err = mcp.NewServer(projectRoot, rpgEnabled)
 	}
 	if err != nil {
 		return fmt.Errorf("failed to create MCP server: %w", err)

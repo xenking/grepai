@@ -1,10 +1,14 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/yoanbernabeu/grepai/git"
@@ -27,10 +31,12 @@ const (
 	OpenAIEmbeddingModelLarge       = "text-embedding-3-large"
 	OpenRouterEmbeddingModelLarge   = "openai/text-embedding-3-large"
 	OpenRouterEmbeddingModelQwen8B  = "qwen/qwen3-embedding-8b"
+	DefaultVoyageAIEmbeddingModel   = "voyage-code-3"
 
 	DefaultOllamaEndpoint     = "http://localhost:11434"
 	DefaultLMStudioEndpoint   = "http://127.0.0.1:1234"
 	DefaultOpenAIEndpoint     = "https://api.openai.com/v1"
+	DefaultVoyageAIEndpoint   = "https://api.voyageai.com/v1"
 	DefaultSyntheticEndpoint  = "https://api.synthetic.new/openai/v1"
 	DefaultOpenRouterEndpoint = "https://openrouter.ai/api/v1"
 
@@ -38,6 +44,7 @@ const (
 	DefaultOpenAIDimensions         = 1536
 	DefaultOpenAILargeDimensions    = 3072
 	DefaultQwen8BDimensions         = 4096
+	DefaultVoyageAIDimensions       = 1024
 	DefaultOpenAIParallelism        = 4
 
 	DefaultPostgresDSN    = "postgres://localhost:5432/grepai"
@@ -71,6 +78,19 @@ type Config struct {
 	Update            UpdateConfig    `yaml:"update"`
 	Ignore            []string        `yaml:"ignore"`
 	ExternalGitignore string          `yaml:"external_gitignore,omitempty"`
+
+	// rawBytes holds the exact bytes of config.yaml as read from disk.
+	// Save() writes them back verbatim when the in-memory config still
+	// matches what Load observed, so that loading + saving a user-owned
+	// file without edits produces a byte-identical result.
+	//
+	// Excluded from YAML (un)marshaling via the "-" tag.
+	rawBytes []byte `yaml:"-"`
+	// loadedSnapshot is a deep copy of the struct produced by Load,
+	// taken after applyDefaults() has run. Save() uses it to detect
+	// whether the user (or the daemon) changed anything that warrants
+	// a rewrite. nil for configs that were never Load()-ed from disk.
+	loadedSnapshot *Config `yaml:"-"`
 }
 
 // UpdateConfig holds auto-update settings
@@ -106,16 +126,50 @@ type BoostRule struct {
 }
 
 type EmbedderConfig struct {
-	Provider    string `yaml:"provider"` // ollama | lmstudio | openai | synthetic | openrouter
-	Model       string `yaml:"model"`
-	Endpoint    string `yaml:"endpoint,omitempty"`
-	APIKey      string `yaml:"api_key,omitempty"`
-	Dimensions  *int   `yaml:"dimensions,omitempty"`
-	Parallelism int    `yaml:"parallelism"` // Number of parallel workers for batch embedding (default: 4)
+	Provider       string `yaml:"provider"` // ollama | lmstudio | openai | voyageai | synthetic | openrouter
+	Model          string `yaml:"model"`
+	Endpoint       string `yaml:"endpoint,omitempty"`
+	APIKey         string `yaml:"api_key,omitempty"`
+	Dimensions     *int   `yaml:"dimensions,omitempty"`
+	Parallelism    int    `yaml:"parallelism,omitempty"`      // Number of parallel workers for batch embedding (default: 4)
+	MaxBatchSize   int    `yaml:"max_batch_size,omitempty"`   // Max chunks per embedding API call (0 = per-provider default)
+	MaxBatchTokens int    `yaml:"max_batch_tokens,omitempty"` // Max tokens per embedding API batch (0 = per-provider default)
+}
+
+// ProviderBatchDefault reports the baked-in batch limits for a provider.
+// Returned values are used when the user does not override them via
+// embedder.max_batch_size / embedder.max_batch_tokens in config.yaml.
+//
+// These defaults are hardened against observed API ceilings:
+//   - voyageai: Voyage enforces 1000 inputs / 120k tokens per request
+//   - openai:   OpenAI allows 2048 inputs / ~300k tokens
+//   - others:   treated like OpenAI (generous, since most are OpenAI-compatible)
+func ProviderBatchDefault(provider string) (maxBatchSize, maxBatchTokens int) {
+	switch provider {
+	case "voyageai":
+		return 900, 80000
+	default:
+		return 2000, 280000
+	}
+}
+
+// ResolveBatchLimits returns the effective batch limits for this embedder
+// config: user-specified values win, otherwise fall back to the per-provider
+// default from ProviderBatchDefault.
+func (e *EmbedderConfig) ResolveBatchLimits() (maxBatchSize, maxBatchTokens int) {
+	maxBatchSize, maxBatchTokens = ProviderBatchDefault(e.Provider)
+	if e.MaxBatchSize > 0 {
+		maxBatchSize = e.MaxBatchSize
+	}
+	if e.MaxBatchTokens > 0 {
+		maxBatchTokens = e.MaxBatchTokens
+	}
+	return maxBatchSize, maxBatchTokens
 }
 
 // GetDimensions returns the configured dimensions or a default value.
 // For OpenAI/OpenRouter, defaults to 1536 (text-embedding-3-small).
+// For Voyage AI, defaults to 1024 (voyage-code-3).
 // For Ollama/LMStudio/Synthetic, defaults to 768 (nomic-embed-text-v1.5).
 func (e *EmbedderConfig) GetDimensions() int {
 	if e.Dimensions != nil {
@@ -131,6 +185,8 @@ func (e *EmbedderConfig) GetDimensions() int {
 		default:
 			return DefaultOpenAIDimensions
 		}
+	case "voyageai":
+		return DefaultVoyageAIDimensions
 	default:
 		return DefaultLocalEmbeddingDimensions
 	}
@@ -138,6 +194,13 @@ func (e *EmbedderConfig) GetDimensions() int {
 
 func DefaultEmbedderForProvider(provider string) EmbedderConfig {
 	switch provider {
+	case "voyageai":
+		return EmbedderConfig{
+			Provider:   "voyageai",
+			Model:      DefaultVoyageAIEmbeddingModel,
+			Endpoint:   DefaultVoyageAIEndpoint,
+			Dimensions: nil, // Voyage AI uses native dimensions (1024)
+		}
 	case "synthetic":
 		dim := DefaultLocalEmbeddingDimensions
 		return EmbedderConfig{
@@ -278,8 +341,13 @@ func (c *FrameworkFeatureConfig) UnmarshalYAML(value *yaml.Node) error {
 }
 
 type WatchConfig struct {
-	DebounceMs                  int       `yaml:"debounce_ms"`
-	LastIndexTime               time.Time `yaml:"last_index_time,omitempty"`
+	DebounceMs int `yaml:"debounce_ms"`
+	// LastIndexTime is populated at Load time from state.yaml so that
+	// existing callers can continue to read cfg.Watch.LastIndexTime
+	// directly. It is intentionally NOT serialized to config.yaml —
+	// runtime state belongs in state.yaml (see state.go). Writes go
+	// through (*State).Save() in the watch loop.
+	LastIndexTime               time.Time `yaml:"-"`
 	RPGPersistIntervalMs        int       `yaml:"rpg_persist_interval_ms,omitempty"`
 	RPGDerivedDebounceMs        int       `yaml:"rpg_derived_debounce_ms,omitempty"`
 	RPGFullReconcileIntervalSec int       `yaml:"rpg_full_reconcile_interval_sec,omitempty"`
@@ -501,6 +569,36 @@ func Load(projectRoot string) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
+	// Detect legacy configs that still carry runtime state inline
+	// (watch.last_index_time). We migrate to state.yaml and strip the
+	// field from the in-memory raw bytes so the next Save rewrites a
+	// clean file. One-shot INFO log per migration event.
+	migrated, migratedTime, strippedBytes, err := detectAndStripLegacyLastIndexTime(data)
+	if err != nil {
+		return nil, fmt.Errorf("migrate legacy state: %w", err)
+	}
+
+	// Load state.yaml (runtime-only fields). Back-compat: if state is
+	// empty but the legacy config had watch.last_index_time, seed it.
+	state, err := LoadState(projectRoot)
+	if err != nil {
+		return nil, fmt.Errorf("load state: %w", err)
+	}
+	if migrated {
+		if state.LastIndexTime.IsZero() || migratedTime.After(state.LastIndexTime) {
+			state.LastIndexTime = migratedTime
+		}
+		if err := state.Save(projectRoot); err != nil {
+			return nil, fmt.Errorf("write migrated state: %w", err)
+		}
+		logMigrationOnce(projectRoot)
+		data = strippedBytes
+	}
+
+	// Populate in-memory fields backed by state.yaml so existing
+	// callers that read cfg.Watch.LastIndexTime keep working.
+	cfg.Watch.LastIndexTime = state.LastIndexTime
+
 	// Apply defaults for missing values (backward compatibility)
 	cfg.applyDefaults()
 
@@ -516,7 +614,110 @@ func Load(projectRoot string) (*Config, error) {
 		}
 	}
 
+	// Capture the post-default snapshot + raw bytes so that Save() can
+	// recognize a "no edits since Load" round-trip and write back the
+	// original bytes untouched.
+	cfg.rawBytes = append([]byte(nil), data...)
+	cfg.loadedSnapshot = deepCopyForSnapshot(&cfg)
+
 	return &cfg, nil
+}
+
+// deepCopyForSnapshot returns a copy of cfg with private tracking
+// fields cleared. We compare by reflect.DeepEqual, so the copy must
+// not reference the original's rawBytes/loadedSnapshot.
+func deepCopyForSnapshot(cfg *Config) *Config {
+	if cfg == nil {
+		return nil
+	}
+	clone := *cfg
+	// Independent slice so later mutation to the original does not
+	// leak into the snapshot.
+	if cfg.Ignore != nil {
+		clone.Ignore = append([]string(nil), cfg.Ignore...)
+	}
+	clone.rawBytes = nil
+	clone.loadedSnapshot = nil
+	return &clone
+}
+
+// detectAndStripLegacyLastIndexTime scans raw config bytes for a
+// `watch.last_index_time` entry under the top-level `watch:` block and
+// removes it if found. Returns the extracted time (if any), the edited
+// bytes, and whether a migration was performed. This is intentionally
+// a conservative string-level edit (matching the upstream yaml.v3
+// formatting) to preserve byte-identity for the rest of the file.
+func detectAndStripLegacyLastIndexTime(data []byte) (migrated bool, when time.Time, stripped []byte, err error) {
+	var node yaml.Node
+	if err := yaml.Unmarshal(data, &node); err != nil {
+		return false, time.Time{}, nil, fmt.Errorf("parse yaml for migration: %w", err)
+	}
+	if len(node.Content) == 0 || node.Content[0].Kind != yaml.MappingNode {
+		return false, time.Time{}, data, nil
+	}
+
+	root := node.Content[0]
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		key := root.Content[i]
+		val := root.Content[i+1]
+		if key.Value != "watch" || val.Kind != yaml.MappingNode {
+			continue
+		}
+		for j := 0; j+1 < len(val.Content); j += 2 {
+			wk := val.Content[j]
+			wv := val.Content[j+1]
+			if wk.Value != "last_index_time" {
+				continue
+			}
+			parsed, perr := time.Parse(time.RFC3339Nano, wv.Value)
+			if perr != nil {
+				// Accept other time formats yaml.v3 might emit.
+				parsed, _ = time.Parse(time.RFC3339, wv.Value)
+			}
+			edited := stripYAMLLineByKey(data, "last_index_time")
+			return true, parsed, edited, nil
+		}
+	}
+	return false, time.Time{}, data, nil
+}
+
+// stripYAMLLineByKey removes lines of the form `  <indent>key: value`
+// from data. It is scoped to the specific key name and tolerates
+// variable leading whitespace. Lines that do not match are preserved
+// verbatim, protecting user formatting.
+func stripYAMLLineByKey(data []byte, key string) []byte {
+	needle := []byte(key + ":")
+	lines := bytes.Split(data, []byte("\n"))
+	out := make([][]byte, 0, len(lines))
+	for _, line := range lines {
+		trimmed := bytes.TrimLeft(line, " \t")
+		if bytes.HasPrefix(trimmed, needle) {
+			// Only strip if the rest of the line is either empty, a
+			// value, or a comment — NOT a nested map where the key is
+			// followed by more content on the same visual level.
+			rest := trimmed[len(needle):]
+			if len(rest) == 0 || rest[0] == ' ' || rest[0] == '\t' {
+				continue
+			}
+		}
+		out = append(out, line)
+	}
+	return bytes.Join(out, []byte("\n"))
+}
+
+// logMigrationOnce emits a single INFO line per process per project
+// when the legacy watch.last_index_time is migrated to state.yaml. We
+// deduplicate by projectRoot to avoid noisy logs when multiple code
+// paths reload the same config.
+var (
+	migrationLogOnce sync.Map // map[string]struct{}
+)
+
+func logMigrationOnce(projectRoot string) {
+	if _, loaded := migrationLogOnce.LoadOrStore(projectRoot, struct{}{}); loaded {
+		return
+	}
+	log.Printf("config: migrated watch.last_index_time from config.yaml to state.yaml for %s", projectRoot)
 }
 
 // applyDefaults fills in missing configuration values with sensible defaults.
@@ -540,7 +741,7 @@ func (c *Config) applyDefaults() {
 		}
 	}
 
-	// Parallelism default (only used by OpenAI embedder)
+	// Parallelism default (used by OpenAI and Voyage AI embedders)
 	if c.Embedder.Parallelism <= 0 {
 		c.Embedder.Parallelism = 4
 	}
@@ -651,12 +852,28 @@ func (c *Config) Save(projectRoot string) error {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
 
+	configPath := GetConfigPath(projectRoot)
+
+	// Round-trip preservation: if this Config was Load()-ed from disk
+	// and nothing observable has changed since, write the original
+	// bytes back verbatim. This keeps user formatting, comments, field
+	// ordering, and absent-section defaults intact — the key property
+	// required by the no-pollution invariant.
+	if c.rawBytes != nil && c.loadedSnapshot != nil {
+		current := deepCopyForSnapshot(c)
+		if reflect.DeepEqual(current, c.loadedSnapshot) {
+			if err := os.WriteFile(configPath, c.rawBytes, 0600); err != nil {
+				return fmt.Errorf("failed to write config file: %w", err)
+			}
+			return nil
+		}
+	}
+
 	data, err := yaml.Marshal(c)
 	if err != nil {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
 
-	configPath := GetConfigPath(projectRoot)
 	if err := os.WriteFile(configPath, data, 0600); err != nil {
 		return fmt.Errorf("failed to write config file: %w", err)
 	}

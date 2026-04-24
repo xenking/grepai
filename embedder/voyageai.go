@@ -16,17 +16,17 @@ import (
 )
 
 const (
-	defaultOpenAIEndpoint         = "https://api.openai.com/v1"
-	defaultOpenAIModel            = "text-embedding-3-small"
-	defaultOpenAI3SmallDimensions = 1536
-	defaultParallelism            = 4
+	defaultVoyageAIEndpoint   = "https://api.voyageai.com/v1"
+	defaultVoyageAIModel      = "voyage-code-3"
+	defaultVoyageAIDimensions = 1024
 )
 
-type OpenAIEmbedder struct {
+type VoyageAIEmbedder struct {
 	endpoint    string
 	model       string
 	apiKey      string
 	dimensions  *int
+	inputType   string // optional: "query", "document", or "" (none)
 	parallelism int
 	retryPolicy RetryPolicy
 	client      *http.Client
@@ -36,84 +36,78 @@ type OpenAIEmbedder struct {
 	batchCfg    BatchConfig
 }
 
-type openAIEmbedRequest struct {
-	Model      string   `json:"model"`
-	Input      []string `json:"input"`
-	Dimensions *int     `json:"dimensions,omitempty"`
+type voyageAIEmbedRequest struct {
+	Model           string   `json:"model"`
+	Input           []string `json:"input"`
+	OutputDimension *int     `json:"output_dimension,omitempty"`
+	InputType       string   `json:"input_type,omitempty"`
 }
 
-type openAIEmbedResponse struct {
-	Data []struct {
-		Embedding []float32 `json:"embedding"`
-		Index     int       `json:"index"`
-	} `json:"data"`
-	Usage struct {
-		PromptTokens int `json:"prompt_tokens"`
-		TotalTokens  int `json:"total_tokens"`
-	} `json:"usage"`
-}
+// voyageAIErrorResponse shares the same structure as OpenAI.
+type voyageAIErrorResponse = openAIErrorResponse
 
-type openAIErrorResponse struct {
-	Error struct {
-		Message string `json:"message"`
-		Type    string `json:"type"`
-	} `json:"error"`
-}
+type VoyageAIOption func(*VoyageAIEmbedder)
 
-type OpenAIOption func(*OpenAIEmbedder)
-
-func WithOpenAIEndpoint(endpoint string) OpenAIOption {
-	return func(e *OpenAIEmbedder) {
+func WithVoyageAIEndpoint(endpoint string) VoyageAIOption {
+	return func(e *VoyageAIEmbedder) {
 		e.endpoint = endpoint
 	}
 }
 
-func WithOpenAIModel(model string) OpenAIOption {
-	return func(e *OpenAIEmbedder) {
+func WithVoyageAIModel(model string) VoyageAIOption {
+	return func(e *VoyageAIEmbedder) {
 		e.model = model
 	}
 }
 
-func WithOpenAIKey(key string) OpenAIOption {
-	return func(e *OpenAIEmbedder) {
+func WithVoyageAIKey(key string) VoyageAIOption {
+	return func(e *VoyageAIEmbedder) {
 		e.apiKey = key
 	}
 }
-func WithOpenAIDimensions(dimensions int) OpenAIOption {
-	return func(e *OpenAIEmbedder) {
+
+func WithVoyageAIDimensions(dimensions int) VoyageAIOption {
+	return func(e *VoyageAIEmbedder) {
 		e.dimensions = &dimensions
 	}
 }
 
-func WithOpenAIParallelism(parallelism int) OpenAIOption {
-	return func(e *OpenAIEmbedder) {
+// WithVoyageAIInputType sets the input_type parameter for the Voyage AI API.
+// Options: "query", "document", or "" (unspecified).
+func WithVoyageAIInputType(inputType string) VoyageAIOption {
+	return func(e *VoyageAIEmbedder) {
+		e.inputType = inputType
+	}
+}
+
+func WithVoyageAIParallelism(parallelism int) VoyageAIOption {
+	return func(e *VoyageAIEmbedder) {
 		if parallelism > 0 {
 			e.parallelism = parallelism
 		}
 	}
 }
 
-func WithOpenAIRetryPolicy(policy RetryPolicy) OpenAIOption {
-	return func(e *OpenAIEmbedder) {
+func WithVoyageAIRetryPolicy(policy RetryPolicy) VoyageAIOption {
+	return func(e *VoyageAIEmbedder) {
 		e.retryPolicy = policy
 	}
 }
 
-// WithOpenAITPMLimit sets the tokens-per-minute limit for proactive rate limiting.
+// WithVoyageAITPMLimit sets the tokens-per-minute limit for proactive rate limiting.
 // When set > 0, the embedder will pace requests to stay within this limit.
-// Default: 0 (disabled). OpenAI Tier 1 limit is 1,000,000 TPM for embeddings.
-func WithOpenAITPMLimit(tpm int64) OpenAIOption {
-	return func(e *OpenAIEmbedder) {
+func WithVoyageAITPMLimit(tpm int64) VoyageAIOption {
+	return func(e *VoyageAIEmbedder) {
 		if tpm > 0 {
 			e.tpmLimit = tpm
 		}
 	}
 }
 
-// WithOpenAIBatchConfig overrides the default OpenAI batch limits. Non-positive
+// WithVoyageAIBatchConfig overrides the default Voyage AI batch limits. Non-positive
 // values are ignored, preserving the built-in defaults.
-func WithOpenAIBatchConfig(cfg BatchConfig) OpenAIOption {
-	return func(e *OpenAIEmbedder) {
+func WithVoyageAIBatchConfig(cfg BatchConfig) VoyageAIOption {
+	return func(e *VoyageAIEmbedder) {
 		if cfg.MaxBatchSize > 0 {
 			e.batchCfg.MaxBatchSize = cfg.MaxBatchSize
 		}
@@ -123,17 +117,17 @@ func WithOpenAIBatchConfig(cfg BatchConfig) OpenAIOption {
 	}
 }
 
-func NewOpenAIEmbedder(opts ...OpenAIOption) (*OpenAIEmbedder, error) {
-	e := &OpenAIEmbedder{
-		endpoint:    defaultOpenAIEndpoint,
-		model:       defaultOpenAIModel,
+func NewVoyageAIEmbedder(opts ...VoyageAIOption) (*VoyageAIEmbedder, error) {
+	e := &VoyageAIEmbedder{
+		endpoint:    defaultVoyageAIEndpoint,
+		model:       defaultVoyageAIModel,
 		dimensions:  nil, // nil = let the model use its native dimensions
 		parallelism: defaultParallelism,
 		retryPolicy: DefaultRetryPolicy(),
 		client: &http.Client{
 			Timeout: 60 * time.Second,
 		},
-		batchCfg: BatchConfig{MaxBatchSize: 2000, MaxBatchTokens: 280000},
+		batchCfg: BatchConfig{MaxBatchSize: 900, MaxBatchTokens: 80000},
 	}
 
 	for _, opt := range opts {
@@ -142,11 +136,11 @@ func NewOpenAIEmbedder(opts ...OpenAIOption) (*OpenAIEmbedder, error) {
 
 	// Try to get API key from environment if not set
 	if e.apiKey == "" {
-		e.apiKey = os.Getenv("OPENAI_API_KEY")
+		e.apiKey = os.Getenv("VOYAGE_API_KEY")
 	}
 
 	if e.apiKey == "" {
-		return nil, fmt.Errorf("OpenAI API key not set (use OPENAI_API_KEY environment variable)")
+		return nil, fmt.Errorf("Voyage AI API key not set (use VOYAGE_API_KEY environment variable)")
 	}
 
 	// Initialize adaptive rate limiter with configured parallelism
@@ -160,7 +154,7 @@ func NewOpenAIEmbedder(opts ...OpenAIOption) (*OpenAIEmbedder, error) {
 	return e, nil
 }
 
-func (e *OpenAIEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
+func (e *VoyageAIEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
 	embeddings, err := e.EmbedBatch(ctx, []string{text})
 	if err != nil {
 		return nil, err
@@ -168,15 +162,16 @@ func (e *OpenAIEmbedder) Embed(ctx context.Context, text string) ([]float32, err
 	return embeddings[0], nil
 }
 
-func (e *OpenAIEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
+func (e *VoyageAIEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
 	if len(texts) == 0 {
 		return nil, nil
 	}
 
-	reqBody := openAIEmbedRequest{
-		Model:      e.model,
-		Input:      texts,
-		Dimensions: e.dimensions,
+	reqBody := voyageAIEmbedRequest{
+		Model:           e.model,
+		Input:           texts,
+		OutputDimension: e.dimensions,
+		InputType:       e.inputType,
 	}
 
 	jsonData, err := json.Marshal(reqBody)
@@ -194,7 +189,7 @@ func (e *OpenAIEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]fl
 
 	resp, err := e.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to send request to OpenAI: %w", err)
+		return nil, fmt.Errorf("failed to send request to Voyage AI: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -204,53 +199,34 @@ func (e *OpenAIEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]fl
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		var errResp openAIErrorResponse
-		if json.Unmarshal(body, &errResp) == nil && errResp.Error.Message != "" {
-			return nil, fmt.Errorf("OpenAI API error: %s", errResp.Error.Message)
-		}
-		return nil, fmt.Errorf("OpenAI returned status %d: %s", resp.StatusCode, string(body))
+		return nil, handleVoyageAIErrorResponse(resp, body)
 	}
 
-	var result openAIEmbedResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	if len(result.Data) != len(texts) {
-		return nil, fmt.Errorf("expected %d embeddings, got %d", len(texts), len(result.Data))
-	}
-
-	// Sort by index to maintain order
-	embeddings := make([][]float32, len(texts))
-	for _, item := range result.Data {
-		embeddings[item.Index] = item.Embedding
-	}
-
-	return embeddings, nil
+	return parseEmbeddingsResponse(body, len(texts))
 }
 
-func (e *OpenAIEmbedder) Dimensions() int {
+func (e *VoyageAIEmbedder) Dimensions() int {
 	if e.dimensions == nil {
-		return defaultOpenAI3SmallDimensions
+		return defaultVoyageAIDimensions
 	}
 	return *e.dimensions
 }
 
-func (e *OpenAIEmbedder) Close() error {
+func (e *VoyageAIEmbedder) Close() error {
 	return nil
 }
 
-// BatchConfig returns batch limits tuned for the OpenAI embeddings API.
-// OpenAI allows up to 2048 inputs and ~300k tokens per batch. Callers may
-// override these defaults via WithOpenAIBatchConfig.
-func (e *OpenAIEmbedder) BatchConfig() BatchConfig {
+// BatchConfig returns batch limits tuned for the Voyage AI embeddings API.
+// Voyage caps requests at 1000 inputs / 120k tokens; we default to 900/80k.
+// Callers may override these defaults via WithVoyageAIBatchConfig.
+func (e *VoyageAIEmbedder) BatchConfig() BatchConfig {
 	return e.batchCfg
 }
 
 // EmbedBatches implements the BatchEmbedder interface.
 // It processes multiple batches concurrently using a bounded worker pool
 // and retries failed requests with exponential backoff.
-func (e *OpenAIEmbedder) EmbedBatches(ctx context.Context, batches []Batch, progress BatchProgress) ([]BatchResult, error) {
+func (e *VoyageAIEmbedder) EmbedBatches(ctx context.Context, batches []Batch, progress BatchProgress) ([]BatchResult, error) {
 	if len(batches) == 0 {
 		return nil, nil
 	}
@@ -291,10 +267,9 @@ func (e *OpenAIEmbedder) EmbedBatches(ctx context.Context, batches []Batch, prog
 	return results, nil
 }
 
-// embedBatchWithRetry embeds a single batch with retry logic for retryable errors.
 // waitForTokenBucket waits for token budget if proactive rate limiting is enabled.
 // Returns an error if the context is canceled while waiting.
-func (e *OpenAIEmbedder) waitForTokenBucket(ctx context.Context, tokens int64) error {
+func (e *VoyageAIEmbedder) waitForTokenBucket(ctx context.Context, tokens int64) error {
 	if e.tokenBucket == nil {
 		return nil
 	}
@@ -312,7 +287,7 @@ func (e *OpenAIEmbedder) waitForTokenBucket(ctx context.Context, tokens int64) e
 
 // calculateRetryDelay determines the delay before the next retry attempt.
 // Uses Retry-After header if available, otherwise falls back to exponential backoff.
-func (e *OpenAIEmbedder) calculateRetryDelay(attempt int, retryErr *RetryableError) time.Duration {
+func (e *VoyageAIEmbedder) calculateRetryDelay(attempt int, retryErr *RetryableError) time.Duration {
 	if retryErr.RateLimitHeaders != nil && retryErr.RateLimitHeaders.RetryAfter > 0 {
 		delay := retryErr.RateLimitHeaders.RetryAfter
 		if delay > 60*time.Second {
@@ -325,7 +300,7 @@ func (e *OpenAIEmbedder) calculateRetryDelay(attempt int, retryErr *RetryableErr
 
 // reportBatchSuccess handles successful batch completion:
 // notifies rate limiter, tracks token usage, updates progress.
-func (e *OpenAIEmbedder) reportBatchSuccess(
+func (e *VoyageAIEmbedder) reportBatchSuccess(
 	batch Batch,
 	totalBatches int,
 	totalChunks int,
@@ -346,7 +321,7 @@ func (e *OpenAIEmbedder) reportBatchSuccess(
 }
 
 // estimateBatchTokens returns the estimated token count for a batch.
-func (e *OpenAIEmbedder) estimateBatchTokens(contents []string) int64 {
+func (e *VoyageAIEmbedder) estimateBatchTokens(contents []string) int64 {
 	if e.tokenBucket == nil {
 		return 0
 	}
@@ -357,7 +332,7 @@ func (e *OpenAIEmbedder) estimateBatchTokens(contents []string) int64 {
 	return total
 }
 
-func (e *OpenAIEmbedder) embedBatchWithRetry(
+func (e *VoyageAIEmbedder) embedBatchWithRetry(
 	ctx context.Context,
 	batch Batch,
 	totalBatches int,
@@ -404,12 +379,13 @@ func (e *OpenAIEmbedder) embedBatchWithRetry(
 	}
 }
 
-// buildEmbedHTTPRequest creates an HTTP request for the OpenAI embeddings API.
-func (e *OpenAIEmbedder) buildEmbedHTTPRequest(ctx context.Context, texts []string) (*http.Request, error) {
-	reqBody := openAIEmbedRequest{
-		Model:      e.model,
-		Input:      texts,
-		Dimensions: e.dimensions,
+// buildEmbedHTTPRequest creates an HTTP request for the Voyage AI embeddings API.
+func (e *VoyageAIEmbedder) buildEmbedHTTPRequest(ctx context.Context, texts []string) (*http.Request, error) {
+	reqBody := voyageAIEmbedRequest{
+		Model:           e.model,
+		Input:           texts,
+		OutputDimension: e.dimensions,
+		InputType:       e.inputType,
 	}
 
 	jsonData, err := json.Marshal(reqBody)
@@ -428,27 +404,24 @@ func (e *OpenAIEmbedder) buildEmbedHTTPRequest(ctx context.Context, texts []stri
 	return req, nil
 }
 
-// handleEmbedErrorResponse parses an error response and returns an appropriate error.
-// Returns a ContextLengthError for context limit exceeded, or a RetryableError for other cases.
-func handleEmbedErrorResponse(resp *http.Response, body []byte) error {
-	var errResp openAIErrorResponse
+// handleVoyageAIErrorResponse parses an error response and returns an appropriate error.
+func handleVoyageAIErrorResponse(resp *http.Response, body []byte) error {
+	var errResp voyageAIErrorResponse
 	msg := string(body)
 	if json.Unmarshal(body, &errResp) == nil && errResp.Error.Message != "" {
 		msg = errResp.Error.Message
 	}
 
-	// Check for context length error (OpenAI returns 400 with specific message)
-	// Common patterns: "maximum context length", "too many tokens"
+	// Check for context length error
 	if resp.StatusCode == http.StatusBadRequest &&
 		(strings.Contains(msg, "maximum context length") ||
 			strings.Contains(msg, "too many tokens") ||
-			strings.Contains(msg, "reduce the length")) {
-		// OpenAI typically includes "8191 tokens" or similar in the message
-		// For simplicity, we don't parse the exact limit from the message
-		return NewContextLengthError(0, 0, 8191, msg)
+			strings.Contains(msg, "reduce the length") ||
+			strings.Contains(msg, "total number of tokens")) {
+		return NewContextLengthError(0, 0, 32000, msg)
 	}
 
-	retryErr := NewRetryableError(resp.StatusCode, fmt.Sprintf("OpenAI API error (status %d): %s", resp.StatusCode, msg))
+	retryErr := NewRetryableError(resp.StatusCode, fmt.Sprintf("Voyage AI API error (status %d): %s", resp.StatusCode, msg))
 	if resp.StatusCode == http.StatusTooManyRequests {
 		headers := parseRateLimitHeaders(resp.Header)
 		retryErr.RateLimitHeaders = &headers
@@ -457,28 +430,9 @@ func handleEmbedErrorResponse(resp *http.Response, body []byte) error {
 	return retryErr
 }
 
-// parseEmbeddingsResponse extracts embeddings from a successful API response.
-func parseEmbeddingsResponse(body []byte, expectedCount int) ([][]float32, error) {
-	var result openAIEmbedResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	if len(result.Data) != expectedCount {
-		return nil, fmt.Errorf("expected %d embeddings, got %d", expectedCount, len(result.Data))
-	}
-
-	embeddings := make([][]float32, expectedCount)
-	for _, item := range result.Data {
-		embeddings[item.Index] = item.Embedding
-	}
-
-	return embeddings, nil
-}
-
-// embedBatchRequest makes a single embedding request to the OpenAI API.
+// embedBatchRequest makes a single embedding request to the Voyage AI API.
 // It returns a RetryableError for HTTP errors that can be retried.
-func (e *OpenAIEmbedder) embedBatchRequest(ctx context.Context, texts []string) ([][]float32, error) {
+func (e *VoyageAIEmbedder) embedBatchRequest(ctx context.Context, texts []string) ([][]float32, error) {
 	if len(texts) == 0 {
 		return nil, nil
 	}
@@ -490,7 +444,7 @@ func (e *OpenAIEmbedder) embedBatchRequest(ctx context.Context, texts []string) 
 
 	resp, err := e.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to send request to OpenAI: %w", err)
+		return nil, fmt.Errorf("failed to send request to Voyage AI: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -500,7 +454,7 @@ func (e *OpenAIEmbedder) embedBatchRequest(ctx context.Context, texts []string) 
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, handleEmbedErrorResponse(resp, body)
+		return nil, handleVoyageAIErrorResponse(resp, body)
 	}
 
 	return parseEmbeddingsResponse(body, len(texts))

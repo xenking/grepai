@@ -31,13 +31,19 @@ import (
 )
 
 var (
-	watchBackground bool
-	watchLogDir     string
-	watchStatus     bool
-	watchStop       bool
-	watchWorkspace  string
-	watchNoUI       bool
+	watchBackground   bool
+	watchLogDir       string
+	watchStatus       bool
+	watchStop         bool
+	watchWorkspace    string
+	watchNoUI         bool
+	watchReadyTimeout time.Duration
 )
+
+// defaultWatchReadyTimeout is the default deadline for the parent CLI to wait
+// for a backgrounded watcher process to signal that it is ready to accept
+// events. Overridable via the --ready-timeout flag (issue #218).
+const defaultWatchReadyTimeout = 30 * time.Second
 
 var (
 	watchIsInteractiveTerminal = isInteractiveTerminal
@@ -93,6 +99,8 @@ func init() {
 	watchCmd.Flags().BoolVar(&watchStop, "stop", false, "Stop the background watcher")
 	watchCmd.Flags().StringVar(&watchWorkspace, "workspace", "", "Workspace name for multi-project mode")
 	watchCmd.Flags().BoolVar(&watchNoUI, "no-ui", false, "Disable interactive UI in foreground mode")
+	watchCmd.Flags().DurationVar(&watchReadyTimeout, "ready-timeout", defaultWatchReadyTimeout,
+		"How long the parent waits for a --background watcher to signal ready before giving up")
 }
 
 func runWatch(cmd *cobra.Command, args []string) error {
@@ -375,9 +383,14 @@ func startBackgroundWatch(logDir, worktreeID string) error {
 		return fmt.Errorf("failed to start background process: %w", err)
 	}
 
-	// Wait for process to become ready or fail
-	// Poll for ready file with timeout, also checking for early child exit
-	const startupTimeout = 30 * time.Second
+	// Wait for process to become ready or fail.
+	// Poll for ready file with timeout, also checking for early child exit.
+	// The timeout is configurable via --ready-timeout (issue #218) because
+	// initial scans on large repos can legitimately exceed the old 30s bound.
+	startupTimeout := watchReadyTimeout
+	if startupTimeout <= 0 {
+		startupTimeout = defaultWatchReadyTimeout
+	}
 	const pollInterval = 250 * time.Millisecond
 	deadline := time.Now().Add(startupTimeout)
 
@@ -433,6 +446,7 @@ func initializeEmbedder(ctx context.Context, cfg *config.Config) (embedder.Embed
 				return nil, fmt.Errorf("cannot connect to Ollama: %w\nMake sure Ollama is running and has the %s model", err, cfg.Embedder.Model)
 			}
 		}
+
 	case "lmstudio":
 		if p, ok := emb.(pinger); ok {
 			if err := p.Ping(ctx); err != nil {
@@ -468,6 +482,26 @@ func initializeStore(ctx context.Context, cfg *config.Config, projectRoot string
 
 const configWriteThrottle = 30 * time.Second
 const rpgDerivedFailureThreshold = 3
+
+// saveRuntimeState persists runtime timestamps (last index / last
+// activity) into state.yaml without touching the user-owned
+// config.yaml. Zero-valued arguments are treated as "no change" for
+// that field — pass a zero time.Time to leave the existing value
+// intact. This function is best-effort: persistence errors are
+// surfaced to the caller but are NOT fatal for the watch loop.
+func saveRuntimeState(projectRoot string, lastIndex, lastActivity time.Time) error {
+	state, err := config.LoadState(projectRoot)
+	if err != nil {
+		return err
+	}
+	if !lastIndex.IsZero() {
+		state.LastIndexTime = lastIndex
+	}
+	if !lastActivity.IsZero() {
+		state.LastActivityTime = lastActivity
+	}
+	return state.Save(projectRoot)
+}
 
 type rpgRealtimeManager struct {
 	mu               sync.Mutex
@@ -1048,18 +1082,31 @@ func watchProjectWithEventObserver(ctx context.Context, projectRoot string, emb 
 	if len(tracedLanguages) == 0 {
 		tracedLanguages = []string{".go", ".js", ".ts", ".jsx", ".tsx", ".vue", ".py", ".php", ".lua", ".java", ".cs", ".fs", ".fsx", ".fsi"}
 	}
+
+	// Signal ready BEFORE the initial scan (issue #218). A full scan on a large
+	// repository can easily exceed 30s; previously the parent CLI would time
+	// out before the daemon had finished, even though the daemon itself was
+	// healthy. Firing onReady here lets the parent exit as soon as the child
+	// is live, while indexing continues in the background.
+	if onReady != nil {
+		onReady()
+	}
+
 	// In multi-worktree mode callers pass isBackgroundChild=true for non-interactive output.
 	// Run initial scan and build symbol index.
-	// In multi-worktree mode callers pass isBackgroundChild=true for non-interactive output.
 	stats, err := runInitialScan(ctx, idx, scanner, extractor, symbolStore, tracedLanguages, cfg.Watch.LastIndexTime, isBackgroundChild, onScan, onEmbed, processorRegistry)
 	if err != nil {
 		return err
 	}
 
 	if stats.FilesIndexed > 0 || stats.ChunksCreated > 0 {
-		cfg.Watch.LastIndexTime = time.Now()
-		if err := cfg.Save(projectRoot); err != nil {
-			log.Printf("Warning: failed to save config: %v", err)
+		now := time.Now()
+		cfg.Watch.LastIndexTime = now
+		// Runtime state (last index + last activity timestamps) lives
+		// in state.yaml, not config.yaml. Writes to config.yaml are
+		// strictly user-driven — see config.Save() round-trip logic.
+		if err := saveRuntimeState(projectRoot, now, now); err != nil {
+			log.Printf("Warning: failed to save state: %v", err)
 		}
 	}
 
@@ -1094,9 +1141,7 @@ func watchProjectWithEventObserver(ctx context.Context, projectRoot string, emb 
 		return fmt.Errorf("failed to start watcher for %s: %w", projectRoot, err)
 	}
 
-	if onReady != nil {
-		onReady()
-	}
+	// Note: the ready signal was already fired above, prior to the initial scan.
 
 	// Run watch loop (responds to ctx.Done() for graceful shutdown)
 	return runProjectWatchLoop(ctx, st, symbolStore, w, idx, scanner, extractor, rpgEncoder, rpgStore, tracedLanguages, projectRoot, cfg, onEvent, onActivity, onStats, processorRegistry)
@@ -2092,6 +2137,17 @@ func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer
 		}
 		if !needsReindex {
 			log.Printf("Skipped unchanged %s", event.Path)
+			// Chunk-skip still counts as observed activity — the
+			// watcher is live and processed an event. Bump
+			// last_activity_time only (NOT last_index_time, nothing
+			// was actually indexed) with the shared throttle.
+			now := time.Now()
+			if now.Sub(*lastConfigWrite) >= configWriteThrottle {
+				if err := saveRuntimeState(projectRoot, time.Time{}, now); err != nil {
+					log.Printf("Warning: failed to save state: %v", err)
+				}
+				*lastConfigWrite = now
+			}
 			return
 		}
 
@@ -2114,12 +2170,16 @@ func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer
 			onStats(projectRoot, delta)
 		}
 
-		// Update last_index_time with throttling (only write if 30 seconds have passed)
+		// Update state.yaml timestamps with throttling (only write if
+		// configWriteThrottle has elapsed since the last save). Both
+		// last_index_time and last_activity_time advance on a
+		// successful index event — see also the EventDelete/EventRename
+		// branch below where only last_activity_time advances.
 		now := time.Now()
 		if now.Sub(*lastConfigWrite) >= configWriteThrottle {
 			cfg.Watch.LastIndexTime = now
-			if err := cfg.Save(projectRoot); err != nil {
-				log.Printf("Warning: failed to save config: %v", err)
+			if err := saveRuntimeState(projectRoot, now, now); err != nil {
+				log.Printf("Warning: failed to save state: %v", err)
 			}
 			*lastConfigWrite = now
 		}
@@ -2189,6 +2249,18 @@ func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer
 				ChunksRemoved: oldChunkCount,
 				SymbolsLost:   oldSymbolCount,
 			})
+		}
+
+		// Bump last_activity_time on delete/rename with the same
+		// throttling as index events, but leave last_index_time alone:
+		// a deletion is activity, not a successful reindex. This is
+		// what `grepai status` surfaces under "Last activity".
+		now := time.Now()
+		if now.Sub(*lastConfigWrite) >= configWriteThrottle {
+			if err := saveRuntimeState(projectRoot, time.Time{}, now); err != nil {
+				log.Printf("Warning: failed to save state: %v", err)
+			}
+			*lastConfigWrite = now
 		}
 
 		if rpgEncoder != nil {
@@ -2471,8 +2543,13 @@ func startBackgroundWorkspaceWatch(logDir string, ws *config.Workspace) error {
 		return fmt.Errorf("failed to start background process: %w", err)
 	}
 
-	// Wait for process to become ready
-	const startupTimeout = 60 * time.Second
+	// Wait for process to become ready. Workspace mode defaults to 60s because
+	// it typically covers multiple projects, but --ready-timeout takes
+	// precedence when the user provided a value.
+	startupTimeout := watchReadyTimeout
+	if startupTimeout <= 0 {
+		startupTimeout = 60 * time.Second
+	}
 	const pollInterval = 250 * time.Millisecond
 	deadline := time.Now().Add(startupTimeout)
 
@@ -2779,9 +2856,10 @@ func initializeWorkspaceRuntime(ctx context.Context, ws *config.Workspace, proje
 		return nil, nil, err
 	}
 	if stats.FilesIndexed > 0 || stats.ChunksCreated > 0 {
-		projectCfg.Watch.LastIndexTime = time.Now()
-		if err := projectCfg.Save(project.Path); err != nil {
-			log.Printf("Warning: failed to save config for %s: %v", project.Name, err)
+		now := time.Now()
+		projectCfg.Watch.LastIndexTime = now
+		if err := saveRuntimeState(project.Path, now, now); err != nil {
+			log.Printf("Warning: failed to save state for %s: %v", project.Name, err)
 		}
 	}
 

@@ -154,7 +154,9 @@ Without `--workspace`, the MCP server resolves its target in this order:
 
 With `--workspace`, the server skips auto-detection and uses the specified workspace directly. The `grepai_search` tool will search across all workspace projects without the agent needing to pass `workspace` or `projects` parameters.
 
-If no local `.grepai/` project is found but global workspaces are configured, `grepai mcp-serve` can still start without `--workspace`. In that mode, tools can receive `workspace` dynamically in each request.
+`grepai mcp-serve` also starts unscoped when neither a local `.grepai/` project nor a workspace can be found. This keeps global MCP client configurations discoverable when the client launches from an arbitrary directory. Search, trace, refs, and status calls still need project/workspace context and will return guidance until you start from a grepai project, pass `workspace`, start with `--workspace`, or run `grepai init` / `grepai workspace create`.
+
+If no local `.grepai/` project is found but global workspaces are configured, `grepai mcp-serve` can start without `--workspace`. In that mode, tools can receive `workspace` dynamically in each request.
 
 ## Usage
 

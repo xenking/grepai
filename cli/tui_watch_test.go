@@ -420,7 +420,7 @@ func TestRenderStatusSummaryIncludesWatcherInfo(t *testing.T) {
 		logFile: "/tmp/grepai-watch.log",
 	}
 
-	out := renderStatusSummary(cfg, stats, watch)
+	out := renderStatusSummary(cfg, stats, watch, &config.State{})
 	if !strings.Contains(out, "Files indexed: 12") {
 		t.Fatalf("summary missing files count: %q", out)
 	}

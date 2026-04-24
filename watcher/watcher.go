@@ -27,6 +27,14 @@ type FileEvent struct {
 	Path string
 }
 
+// atomicDirRewatchWindow is how long we wait for a CREATE after a DELETE on a
+// watched directory before giving up and concluding the directory is really
+// gone. Many editors (Claude Code, VSCode, JetBrains) do a write-rename that
+// atomically replaces a directory inode; fsnotify drops the watch on the old
+// inode, so we need a short grace period to re-arm it on the new one. See
+// issue #225.
+const atomicDirRewatchWindow = 500 * time.Millisecond
+
 type Watcher struct {
 	root       string
 	watcher    *fsnotify.Watcher
@@ -39,6 +47,15 @@ type Watcher struct {
 	pending   map[string]FileEvent
 	pendingMu sync.Mutex
 	timer     *time.Timer
+
+	// Atomic-write re-arm state (issue #225). watchedDirs tracks every
+	// directory path we have successfully Add()ed; pendingRewatch records
+	// directories that emitted a DELETE/RENAME and are awaiting a matching
+	// CREATE within atomicDirRewatchWindow.
+	dirMu           sync.Mutex
+	watchedDirs     map[string]struct{}
+	pendingRewatch  map[string]*time.Timer
+	rewatchInterval time.Duration
 }
 
 func NewWatcher(root string, ignore *indexer.IgnoreMatcher, debounceMs int) (*Watcher, error) {
@@ -48,13 +65,16 @@ func NewWatcher(root string, ignore *indexer.IgnoreMatcher, debounceMs int) (*Wa
 	}
 
 	return &Watcher{
-		root:       root,
-		watcher:    fsw,
-		ignore:     ignore,
-		debounceMs: debounceMs,
-		events:     make(chan FileEvent, 100),
-		done:       make(chan struct{}),
-		pending:    make(map[string]FileEvent),
+		root:            root,
+		watcher:         fsw,
+		ignore:          ignore,
+		debounceMs:      debounceMs,
+		events:          make(chan FileEvent, 100),
+		done:            make(chan struct{}),
+		pending:         make(map[string]FileEvent),
+		watchedDirs:     make(map[string]struct{}),
+		pendingRewatch:  make(map[string]*time.Timer),
+		rewatchInterval: atomicDirRewatchWindow,
 	}, nil
 }
 
@@ -76,6 +96,13 @@ func (w *Watcher) Events() <-chan FileEvent {
 
 func (w *Watcher) Close() error {
 	close(w.done)
+	// Cancel any in-flight rewatch timers so we don't leak goroutines.
+	w.dirMu.Lock()
+	for path, t := range w.pendingRewatch {
+		t.Stop()
+		delete(w.pendingRewatch, path)
+	}
+	w.dirMu.Unlock()
 	return w.watcher.Close()
 }
 
@@ -99,6 +126,8 @@ func (w *Watcher) addRecursive(root string) error {
 			if !w.ignore.ShouldIgnore(relPath) {
 				if err := w.watcher.Add(path); err != nil {
 					log.Printf("Failed to watch %s: %v", path, err)
+				} else {
+					w.rememberDir(path)
 				}
 			}
 			return nil
@@ -111,6 +140,75 @@ func (w *Watcher) addRecursive(root string) error {
 
 		return nil
 	})
+}
+
+// rememberDir records that we successfully registered a watch on path.
+func (w *Watcher) rememberDir(path string) {
+	w.dirMu.Lock()
+	w.watchedDirs[path] = struct{}{}
+	if t, ok := w.pendingRewatch[path]; ok {
+		t.Stop()
+		delete(w.pendingRewatch, path)
+	}
+	w.dirMu.Unlock()
+}
+
+// isWatchedDir reports whether path was previously registered via rememberDir.
+func (w *Watcher) isWatchedDir(path string) bool {
+	w.dirMu.Lock()
+	_, ok := w.watchedDirs[path]
+	w.dirMu.Unlock()
+	return ok
+}
+
+// forgetDir is used when we've concluded a directory is truly gone (the
+// re-arm window expired without a matching CREATE).
+func (w *Watcher) forgetDir(path string) {
+	w.dirMu.Lock()
+	delete(w.watchedDirs, path)
+	delete(w.pendingRewatch, path)
+	w.dirMu.Unlock()
+}
+
+// scheduleRewatch arms a timer: if a matching CREATE for path does not arrive
+// within rewatchInterval, we treat the directory as permanently gone and stop
+// tracking it. If CREATE does arrive (via rearmAfterCreate), the timer is
+// cancelled and the watch is re-registered on the new inode.
+func (w *Watcher) scheduleRewatch(path string) {
+	w.dirMu.Lock()
+	if existing, ok := w.pendingRewatch[path]; ok {
+		existing.Stop()
+	}
+	w.pendingRewatch[path] = time.AfterFunc(w.rewatchInterval, func() {
+		w.forgetDir(path)
+	})
+	w.dirMu.Unlock()
+}
+
+// rearmAfterCreate re-registers a watch on path if it was previously watched
+// and is currently in the atomic-rewatch window. Returns true when a rewatch
+// was performed.
+func (w *Watcher) rearmAfterCreate(path string) bool {
+	w.dirMu.Lock()
+	_, pending := w.pendingRewatch[path]
+	_, wasWatched := w.watchedDirs[path]
+	w.dirMu.Unlock()
+
+	if !pending && !wasWatched {
+		return false
+	}
+
+	info, err := os.Stat(path)
+	if err != nil || !info.IsDir() {
+		return false
+	}
+
+	if err := w.addRecursive(path); err != nil {
+		log.Printf("Failed to re-arm watch on %s after atomic write: %v", path, err)
+		return false
+	}
+	log.Printf("Re-armed watch on %s after atomic-write cycle", path)
+	return true
 }
 
 func (w *Watcher) processEvents(ctx context.Context) {
@@ -135,6 +233,22 @@ func (w *Watcher) processEvents(ctx context.Context) {
 }
 
 func (w *Watcher) handleEvent(event fsnotify.Event) {
+	// First, handle directory re-arm semantics (issue #225). We intentionally
+	// do this before the hidden/ignored filtering below, because some editors
+	// use atomic-write on directories whose basename starts with "." (for
+	// example, rename-to-target with a ".tmp" dotdir).
+	if event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename) {
+		if w.isWatchedDir(event.Name) {
+			w.scheduleRewatch(event.Name)
+		}
+	}
+	if event.Has(fsnotify.Create) {
+		if w.rearmAfterCreate(event.Name) {
+			// Note: we still fall through so the CREATE is emitted as a
+			// normal FileEvent for any file within the directory's walk.
+		}
+	}
+
 	relPath, err := filepath.Rel(w.root, event.Name)
 	if err != nil {
 		return

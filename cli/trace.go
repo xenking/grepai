@@ -19,6 +19,26 @@ import (
 	"github.com/yoanbernabeu/grepai/trace"
 )
 
+// hasUsefulCallers reports whether result.Callers contains at least
+// one caller that is NOT the target's own definition site. The fast
+// regex extractor occasionally captures `func Name(` as a call site
+// referencing itself; those self-edges are indistinguishable from
+// real 0-caller scenarios from the user's perspective, and should
+// also trigger the value-reference fallback. `target` may be nil —
+// in that case any caller is considered useful.
+func hasUsefulCallers(callers []trace.CallerInfo, target *trace.Symbol) bool {
+	if target == nil {
+		return len(callers) > 0
+	}
+	for _, c := range callers {
+		if c.CallSite.File == target.File && c.CallSite.Line == target.Line {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
 func pickBestTargetSymbol(candidates []trace.Symbol, refs []trace.Reference) *trace.Symbol {
 	if len(candidates) == 0 {
 		return nil
@@ -80,6 +100,12 @@ var (
 	traceUI        bool
 	traceWorkspace string
 	traceProject   string
+	// traceIncludeRefs controls the value-reference post-pass on
+	// `trace callers` / `trace graph`. See the patch 7 note on
+	// traceCallersCmd.Long for the rationale. Default is true for
+	// callers (visibility wins), false for graph (edges only).
+	traceIncludeRefs      bool
+	traceGraphIncludeRefs bool
 )
 
 var runTraceActionCardUIRunner = runTraceActionCardUI
@@ -102,6 +128,11 @@ var traceCallersCmd = &cobra.Command{
 	Use:   "callers <symbol>",
 	Short: "Find all functions that call the specified symbol",
 	Long: `Find all functions that call the specified symbol.
+
+When direct callers return nothing, an identifier-reference scan
+surfaces value-passed usages (e.g. handler registration, go Fn,
+tc.Execute(ctx, Fn)) under a separate "references" field. Disable
+with --include-refs=false.
 
 Examples:
   grepai trace callers "Login"
@@ -149,6 +180,13 @@ func init() {
 		cmd.Flags().StringVar(&traceProject, "project", "", "Project name within workspace (requires --workspace)")
 	}
 	traceGraphCmd.Flags().IntVarP(&traceDepth, "depth", "d", 2, "Maximum depth for graph traversal")
+
+	// Value-reference flags. Defaults differ by subcommand:
+	// callers → on (prioritize visibility), graph → off (edges only).
+	traceCallersCmd.Flags().BoolVar(&traceIncludeRefs, "include-refs", true,
+		"Include value-passed references (handler registration, go Fn, tc.Execute(ctx, Fn)) when no direct callers are found")
+	traceGraphCmd.Flags().BoolVar(&traceGraphIncludeRefs, "include-refs", false,
+		"Include value-passed references alongside call-graph edges")
 
 	traceCmd.AddCommand(traceCallersCmd)
 	traceCmd.AddCommand(traceCalleesCmd)
@@ -314,6 +352,28 @@ func runTraceCallers(cmd *cobra.Command, args []string) error {
 	}
 	if cfg != nil {
 		enrichTraceWithRPG(projectRoot, cfg, &result)
+	}
+
+	// Value-reference fallback: when direct callers are empty (or
+	// only contain self-references at the definition site — an
+	// artifact of the regex extractor picking up `func Name(`) we
+	// scan indexed files for bare identifier usages. See patch 7.
+	if hasUsefulCallers(result.Callers, result.Symbol) {
+		// Nothing to do — callers already show real usage.
+	} else if traceIncludeRefs {
+		refs, rerr := trace.FindValueReferences(ctx, symbolStore, projectRoot, symbolName)
+		if rerr != nil {
+			log.Printf("Warning: failed to scan for value references: %v", rerr)
+		}
+		result.References = refs
+	} else if !traceJSON && !traceTOON && !traceUI {
+		// Non-UI hint: in JSON/TOON/UI modes we stay silent because
+		// the user asked for machine-readable output.
+		refs, rerr := trace.FindValueReferences(ctx, symbolStore, projectRoot, symbolName)
+		if rerr == nil && len(refs) > 0 {
+			fmt.Fprintf(cmd.ErrOrStderr(),
+				"note: 0 direct callers; %d identifier references exist (use --include-refs=true)\n", len(refs))
+		}
 	}
 
 	return outputAndRecord(result, traceViewCallers, projectRoot, gstats.TraceCallers, len(result.Callers))
@@ -572,6 +632,16 @@ func runTraceGraph(cmd *cobra.Command, args []string) error {
 	}
 	if cfg != nil {
 		enrichTraceWithRPG(projectRoot, cfg, &result)
+	}
+
+	// Optional value-reference fallback on `trace graph`. Off by
+	// default because a graph user usually cares about edges only.
+	if traceGraphIncludeRefs && (result.Graph == nil || len(result.Graph.Edges) == 0) {
+		refs, rerr := trace.FindValueReferences(ctx, symbolStore, projectRoot, symbolName)
+		if rerr != nil {
+			log.Printf("Warning: failed to scan for value references: %v", rerr)
+		}
+		result.References = refs
 	}
 
 	nodeCount := 0

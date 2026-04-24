@@ -274,8 +274,11 @@ func TestHandleSearch_NoWorkspaceHint_WhenNoWorkspacesConfigured(t *testing.T) {
 		t.Fatalf("expected text content, got %T", result.Content[0])
 	}
 
-	if !strings.Contains(textContent.Text, "failed to read config file") {
-		t.Fatalf("expected fallback config error, got: %s", textContent.Text)
+	if !strings.Contains(textContent.Text, "requires a project or workspace context") {
+		t.Fatalf("expected context guidance, got: %s", textContent.Text)
+	}
+	if !strings.Contains(textContent.Text, "grepai init") || !strings.Contains(textContent.Text, "grepai workspace create") {
+		t.Fatalf("expected initialization guidance, got: %s", textContent.Text)
 	}
 	if strings.Contains(textContent.Text, "no workspace was provided") {
 		t.Fatalf("workspace hint should not appear when no workspaces are configured: %s", textContent.Text)

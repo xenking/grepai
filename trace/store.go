@@ -547,6 +547,20 @@ func (s *GOBSymbolStore) IsFileIndexed(filePath string) bool {
 	return s.fileIndex[filePath]
 }
 
+// ListIndexedFiles returns a snapshot of every file path tracked by
+// this symbol store. Used by the value-reference scanner in the
+// `trace callers` post-pass so it knows which files to re-read when
+// the direct call-site lookup returns nothing. Order is unspecified.
+func (s *GOBSymbolStore) ListIndexedFiles() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]string, 0, len(s.fileIndex))
+	for path := range s.fileIndex {
+		out = append(out, path)
+	}
+	return out
+}
+
 // GetFileContentHash returns the stored content hash for a file when available.
 func (s *GOBSymbolStore) GetFileContentHash(filePath string) (string, bool) {
 	s.mu.RLock()
