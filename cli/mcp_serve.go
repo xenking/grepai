@@ -16,7 +16,8 @@ var mcpServeCmd = &cobra.Command{
 	Long: `Start grepai as an MCP (Model Context Protocol) server.
 
 This allows AI agents to use grepai as a native tool through the MCP protocol.
-The server communicates via stdio and exposes the following tools:
+The server communicates via stdio by default, or Streamable HTTP when
+--transport=streamable-http is selected. It exposes the following tools:
 
   - grepai_search: Semantic code search with natural language (includes RPG context when enabled)
   - grepai_trace_callers: Find all functions that call a symbol
@@ -40,6 +41,9 @@ Arguments:
 Flags:
   --workspace   Workspace name. When set, serves using workspace config from
                 ~/.grepai/workspace.yaml without requiring local .grepai/.
+  --transport   MCP transport: stdio (default) or streamable-http.
+  --http-bind   Streamable HTTP listen address (default 127.0.0.1:8762).
+  --http-path   Streamable HTTP endpoint path (default /mcp).
 
 Configuration for Claude Code:
   claude mcp add grepai -- grepai mcp-serve
@@ -68,9 +72,28 @@ Configuration for Cursor with explicit path (recommended for Windows):
 	RunE: runMCPServe,
 }
 
+const (
+	mcpTransportStdio          = "stdio"
+	mcpTransportStreamableHTTP = "streamable-http"
+)
+
 func init() {
 	mcpServeCmd.Flags().String("workspace", "", "Workspace name for workspace-only mode (no local .grepai/ required)")
+	mcpServeCmd.Flags().String("transport", mcpTransportStdio, "MCP transport: stdio or streamable-http")
+	mcpServeCmd.Flags().String("http-bind", mcp.DefaultStreamableHTTPOptions().Bind, "Streamable HTTP listen address")
+	mcpServeCmd.Flags().String("http-path", mcp.DefaultStreamableHTTPOptions().EndpointPath, "Streamable HTTP MCP endpoint path")
+	mcpServeCmd.Flags().StringSlice("http-allow-origin", nil, "Additional allowed Origin header for Streamable HTTP (repeatable)")
+	mcpServeCmd.Flags().Bool("http-stateless", false, "Use stateless Streamable HTTP sessions")
 	rootCmd.AddCommand(mcpServeCmd)
+}
+
+func validateMCPTransport(transport string) error {
+	switch transport {
+	case mcpTransportStdio, mcpTransportStreamableHTTP:
+		return nil
+	default:
+		return fmt.Errorf("unsupported MCP transport %q (expected %q or %q)", transport, mcpTransportStdio, mcpTransportStreamableHTTP)
+	}
 }
 
 // resolveMCPTarget determines the project root and/or workspace for the MCP server.
@@ -167,6 +190,10 @@ func resolveRPGEnabled(projectRoot string) bool {
 
 func runMCPServe(cmd *cobra.Command, args []string) error {
 	workspaceFlag, _ := cmd.Flags().GetString("workspace")
+	transport, _ := cmd.Flags().GetString("transport")
+	if err := validateMCPTransport(transport); err != nil {
+		return err
+	}
 
 	var explicitPath string
 	if len(args) > 0 {
@@ -188,6 +215,19 @@ func runMCPServe(cmd *cobra.Command, args []string) error {
 	}
 	if err != nil {
 		return fmt.Errorf("failed to create MCP server: %w", err)
+	}
+
+	if transport == mcpTransportStreamableHTTP {
+		httpBind, _ := cmd.Flags().GetString("http-bind")
+		httpPath, _ := cmd.Flags().GetString("http-path")
+		allowedOrigins, _ := cmd.Flags().GetStringSlice("http-allow-origin")
+		httpStateless, _ := cmd.Flags().GetBool("http-stateless")
+		return srv.ServeStreamableHTTP(mcp.StreamableHTTPOptions{
+			Bind:           httpBind,
+			EndpointPath:   httpPath,
+			AllowedOrigins: allowedOrigins,
+			Stateful:       !httpStateless,
+		})
 	}
 
 	return srv.Serve()

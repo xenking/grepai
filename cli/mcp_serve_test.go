@@ -166,6 +166,18 @@ func TestResolveMCPWorkspace(t *testing.T) {
 	})
 }
 
+func TestValidateMCPTransport(t *testing.T) {
+	for _, transport := range []string{mcpTransportStdio, mcpTransportStreamableHTTP} {
+		if err := validateMCPTransport(transport); err != nil {
+			t.Fatalf("expected %q to be valid: %v", transport, err)
+		}
+	}
+
+	if err := validateMCPTransport("sse"); err == nil || !strings.Contains(err.Error(), "unsupported MCP transport") {
+		t.Fatalf("expected unsupported transport error, got %v", err)
+	}
+}
+
 func TestResolveRPGEnabled_ReturnsFalseWhenProjectRootEmpty(t *testing.T) {
 	if resolveRPGEnabled("") {
 		t.Error("expected false for empty projectRoot, got true")

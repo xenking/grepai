@@ -9,6 +9,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -2066,6 +2069,10 @@ func (s *Server) createStore(ctx context.Context, cfg *config.Config) (store.Vec
 }
 
 // Serve starts the MCP server using stdio transport.
+//
+// Stdio remains the default transport because most local MCP client
+// configurations launch grepai as a subprocess. Use ServeStreamableHTTP for a
+// long-running HTTP MCP endpoint when the client supports Streamable HTTP.
 // ListTools returns the map of registered MCP tools, keyed by tool name.
 // This is primarily used for testing.
 func (s *Server) ListTools() map[string]interface{} {
@@ -2087,6 +2094,135 @@ func (s *Server) Serve() error {
 	// Start listening with fixed stdout
 	ctx := context.Background()
 	return stdioServer.Listen(ctx, os.Stdin, fixedStdout)
+}
+
+// StreamableHTTPOptions configures grepai's Streamable HTTP MCP transport.
+type StreamableHTTPOptions struct {
+	// Bind is the HTTP listen address. Prefer localhost for local MCP servers.
+	Bind string
+	// EndpointPath is the single MCP endpoint path, for example /mcp.
+	EndpointPath string
+	// AllowedOrigins are additional Origin header values accepted by the DNS
+	// rebinding guard. Empty Origin and loopback origins are always allowed.
+	AllowedOrigins []string
+	// Stateful enables stateful session IDs. It is safe for a single local
+	// process and should not be used behind a non-sticky multi-instance proxy.
+	Stateful bool
+	// HeartbeatInterval controls optional SSE heartbeats on long-lived GET
+	// streams. Zero disables heartbeats.
+	HeartbeatInterval time.Duration
+	// SessionIdleTTL lets mcp-go sweep idle session state. Zero disables sweeping.
+	SessionIdleTTL time.Duration
+}
+
+// DefaultStreamableHTTPOptions returns local-first Streamable HTTP defaults.
+func DefaultStreamableHTTPOptions() StreamableHTTPOptions {
+	return StreamableHTTPOptions{
+		Bind:              "127.0.0.1:8762",
+		EndpointPath:      "/mcp",
+		Stateful:          true,
+		HeartbeatInterval: 30 * time.Second,
+		SessionIdleTTL:    10 * time.Minute,
+	}
+}
+
+func (opts StreamableHTTPOptions) withDefaults() StreamableHTTPOptions {
+	defaults := DefaultStreamableHTTPOptions()
+	if opts.Bind == "" {
+		opts.Bind = defaults.Bind
+	}
+	if opts.EndpointPath == "" {
+		opts.EndpointPath = defaults.EndpointPath
+	}
+	if opts.HeartbeatInterval == 0 {
+		opts.HeartbeatInterval = defaults.HeartbeatInterval
+	}
+	if opts.SessionIdleTTL == 0 {
+		opts.SessionIdleTTL = defaults.SessionIdleTTL
+	}
+	return opts
+}
+
+// NormalizeStreamableHTTPEndpointPath normalizes an MCP endpoint path.
+func NormalizeStreamableHTTPEndpointPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "/mcp"
+	}
+	return "/" + strings.Trim(path, "/")
+}
+
+// ServeStreamableHTTP starts the MCP server using Streamable HTTP transport.
+func (s *Server) ServeStreamableHTTP(opts StreamableHTTPOptions) error {
+	opts = opts.withDefaults()
+	httpServer := &http.Server{
+		Addr:              opts.Bind,
+		Handler:           s.StreamableHTTPHandler(opts),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	return httpServer.ListenAndServe()
+}
+
+// StreamableHTTPHandler builds an HTTP handler for tests and embedded servers.
+func (s *Server) StreamableHTTPHandler(opts StreamableHTTPOptions) http.Handler {
+	opts = opts.withDefaults()
+	endpointPath := NormalizeStreamableHTTPEndpointPath(opts.EndpointPath)
+
+	transportOpts := []server.StreamableHTTPOption{
+		server.WithEndpointPath(endpointPath),
+		server.WithSessionIdleTTL(opts.SessionIdleTTL),
+	}
+	if opts.Stateful {
+		transportOpts = append(transportOpts, server.WithStateful(true))
+	}
+	if opts.HeartbeatInterval > 0 {
+		transportOpts = append(transportOpts, server.WithHeartbeatInterval(opts.HeartbeatInterval))
+	}
+
+	streamable := server.NewStreamableHTTPServer(s.mcpServer, transportOpts...)
+	mux := http.NewServeMux()
+	mux.Handle(endpointPath, originGuard(opts.AllowedOrigins, streamable))
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write([]byte("ok\n"))
+	})
+	return mux
+}
+
+func originGuard(allowedOrigins []string, next http.Handler) http.Handler {
+	allowed := make(map[string]struct{}, len(allowedOrigins))
+	for _, origin := range allowedOrigins {
+		origin = strings.TrimSpace(origin)
+		if origin != "" {
+			allowed[origin] = struct{}{}
+		}
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" && !isAllowedOrigin(origin, allowed) {
+			http.Error(w, "forbidden origin", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func isAllowedOrigin(origin string, allowed map[string]struct{}) bool {
+	if _, ok := allowed[origin]; ok {
+		return true
+	}
+
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	host := u.Hostname()
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // titleFixWriter wraps io.Writer to fix tool titles in responses

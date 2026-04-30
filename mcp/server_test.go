@@ -3,17 +3,111 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	mcpclient "github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	"github.com/yoanbernabeu/grepai/config"
 	"github.com/yoanbernabeu/grepai/store"
 	"github.com/yoanbernabeu/grepai/trace"
 )
+
+func TestNormalizeStreamableHTTPEndpointPath(t *testing.T) {
+	tests := map[string]string{
+		"":        "/mcp",
+		"mcp":     "/mcp",
+		"/mcp":    "/mcp",
+		"/mcp/":   "/mcp",
+		"api/mcp": "/api/mcp",
+	}
+	for input, want := range tests {
+		if got := NormalizeStreamableHTTPEndpointPath(input); got != want {
+			t.Fatalf("NormalizeStreamableHTTPEndpointPath(%q)=%q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestStreamableHTTPHandlerOriginGuard(t *testing.T) {
+	srv, err := NewServer("", false)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	handler := srv.StreamableHTTPHandler(StreamableHTTPOptions{EndpointPath: "/mcp"})
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader("{}"))
+	req.Header.Set("Origin", "https://evil.example")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected forbidden origin to return 403, got %d", rec.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader("{}"))
+	req.Header.Set("Origin", "http://localhost:3000")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code == http.StatusForbidden {
+		t.Fatal("expected localhost origin to pass origin guard")
+	}
+}
+
+func TestStreamableHTTPHandlerListsTools(t *testing.T) {
+	srv, err := NewServer("", false)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	httpSrv := httptest.NewServer(srv.StreamableHTTPHandler(StreamableHTTPOptions{
+		EndpointPath:      "/mcp",
+		HeartbeatInterval: time.Millisecond,
+		SessionIdleTTL:    time.Minute,
+		Stateful:          true,
+	}))
+	defer httpSrv.Close()
+
+	client, err := mcpclient.NewStreamableHttpClient(httpSrv.URL + "/mcp")
+	if err != nil {
+		t.Fatalf("NewStreamableHttpClient: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("client start: %v", err)
+	}
+	defer client.Close()
+
+	_, err = client.Initialize(ctx, mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+			ClientInfo: mcp.Implementation{
+				Name:    "grepai-test-client",
+				Version: "1.0.0",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+
+	tools, err := client.ListTools(ctx, mcp.ListToolsRequest{})
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	for _, tool := range tools.Tools {
+		if tool.Name == "grepai_search" {
+			return
+		}
+	}
+	t.Fatalf("grepai_search not found in Streamable HTTP tools: %#v", tools.Tools)
+}
 
 // TestServerCreateEmbedder_AppliesConfiguredDimensions verifies that createEmbedder
 // passes configured dimension into each embedder constructor.

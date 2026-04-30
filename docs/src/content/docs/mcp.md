@@ -3,7 +3,7 @@ title: MCP Integration
 description: Use grepai as a native MCP tool for AI agents
 ---
 
-grepai includes a built-in MCP (Model Context Protocol) server that allows AI agents to use semantic code search as a native tool.
+grepai includes a built-in MCP (Model Context Protocol) server that allows AI agents to use semantic code search as a native tool. It supports stdio for subprocess-based local clients and Streamable HTTP for long-running HTTP MCP endpoints.
 
 ## What is MCP?
 
@@ -136,6 +136,41 @@ Add to `.config/opencode/opencode.jsonc` MCP section, or `[YourProject]/opencode
 }
 ```
 
+
+## Transports
+
+### stdio (default)
+
+`grepai mcp-serve` uses stdio by default. This is the best fit for clients that launch MCP servers as subprocesses, such as local Claude/Codex-style configurations. Stdio mode must write only MCP JSON-RPC messages to stdout; grepai keeps logs/errors on stderr.
+
+```bash
+grepai mcp-serve /path/to/project
+```
+
+### Streamable HTTP
+
+Use Streamable HTTP when the MCP client can connect to a long-running HTTP server instead of owning the server process. By default grepai binds to localhost only and serves one MCP endpoint at `/mcp`:
+
+```bash
+grepai mcp-serve /path/to/project \
+  --transport streamable-http \
+  --http-bind 127.0.0.1:8762 \
+  --http-path /mcp
+```
+
+Security defaults:
+
+- bind to `127.0.0.1` unless you intentionally expose the server;
+- empty `Origin` headers and loopback origins are allowed;
+- non-loopback browser origins are rejected unless explicitly added with `--http-allow-origin`;
+- stateful sessions are enabled for a single local process; use `--http-stateless` only when the client/deployment expects stateless requests.
+
+```bash
+grepai mcp-serve /path/to/project \
+  --transport streamable-http \
+  --http-allow-origin https://trusted.local
+```
+
 ## Workspace Mode
 
 When started with the `--workspace` flag, the MCP server automatically injects the workspace into search requests. This means AI agents can use `grepai_search` without specifying the `workspace` parameter — cross-project search works by default.
@@ -204,6 +239,7 @@ Before using MCP mode, ensure:
 
 ### Connection errors
 
-- MCP server uses stdio transport (local process communication)
-- No network ports are opened
-- Check that `grepai mcp-serve` runs without errors when invoked directly
+- Default stdio mode uses local process communication and opens no network ports.
+- Streamable HTTP mode opens the address configured by `--http-bind`; prefer `127.0.0.1:8762`.
+- Check that `grepai mcp-serve` runs without errors when invoked directly.
+- For Streamable HTTP clients, configure the full endpoint URL, for example `http://127.0.0.1:8762/mcp`.
