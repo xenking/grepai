@@ -1102,6 +1102,7 @@ func watchProjectWithEventObserver(ctx context.Context, projectRoot string, emb 
 	if stats.FilesIndexed > 0 || stats.ChunksCreated > 0 {
 		now := time.Now()
 		cfg.Watch.LastIndexTime = now
+		idx.SetLastIndexTime(now)
 		// Runtime state (last index + last activity timestamps) lives
 		// in state.yaml, not config.yaml. Writes to config.yaml are
 		// strictly user-driven — see config.Save() round-trip logic.
@@ -1186,6 +1187,9 @@ func runProjectWatchLoop(ctx context.Context, st store.VectorStore, symbolStore 
 	persistTicker := time.NewTicker(30 * time.Second)
 	defer persistTicker.Stop()
 
+	reconcileTicker := time.NewTicker(time.Duration(cfg.Watch.ReconcileIntervalSec) * time.Second)
+	defer reconcileTicker.Stop()
+
 	var lastConfigWrite time.Time
 	var rpgManager *rpgRealtimeManager
 	if rpgEncoder != nil && rpgStore != nil {
@@ -1220,6 +1224,38 @@ func runProjectWatchLoop(ctx context.Context, st store.VectorStore, symbolStore 
 				if err := rpgStore.Persist(ctx); err != nil {
 					log.Printf("Warning: failed to persist RPG graph for %s: %v", projectRoot, err)
 				}
+			}
+
+		case <-reconcileTicker.C:
+			stats, err := runInitialScan(ctx, idx, scanner, extractor, symbolStore, tracedLanguages, cfg.Watch.LastIndexTime, true, nil, nil, processors...)
+			if err != nil {
+				log.Printf("Warning: periodic reconcile failed for %s: %v", projectRoot, err)
+				continue
+			}
+			if stats.FilesIndexed > 0 || stats.ChunksCreated > 0 {
+				now := time.Now()
+				cfg.Watch.LastIndexTime = now
+				idx.SetLastIndexTime(now)
+				if err := saveRuntimeState(projectRoot, now, now); err != nil {
+					log.Printf("Warning: failed to save state after periodic reconcile for %s: %v", projectRoot, err)
+				}
+				if onStats != nil {
+					onStats(projectRoot, watchStatsDelta{
+						FilesIndexed:  stats.FilesIndexed,
+						ChunksCreated: stats.ChunksCreated,
+						FilesRemoved:  stats.FilesRemoved,
+					})
+				}
+				log.Printf("Periodic reconcile indexed changes for %s: files=%d chunks=%d removed=%d", projectRoot, stats.FilesIndexed, stats.ChunksCreated, stats.FilesRemoved)
+			} else if stats.FilesRemoved > 0 {
+				now := time.Now()
+				if err := saveRuntimeState(projectRoot, time.Time{}, now); err != nil {
+					log.Printf("Warning: failed to save state after periodic reconcile for %s: %v", projectRoot, err)
+				}
+				if onStats != nil {
+					onStats(projectRoot, watchStatsDelta{FilesRemoved: stats.FilesRemoved})
+				}
+				log.Printf("Periodic reconcile removed missing files for %s: removed=%d", projectRoot, stats.FilesRemoved)
 			}
 
 		case event := <-w.Events():

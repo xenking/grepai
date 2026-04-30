@@ -79,6 +79,12 @@ func NewIndexer(
 	}
 }
 
+// SetLastIndexTime updates the incremental scan watermark used by future full
+// scan/reconcile passes.
+func (idx *Indexer) SetLastIndexTime(t time.Time) {
+	idx.lastIndexTime = t
+}
+
 // IndexAll performs a full index of the project (no progress reporting)
 func (idx *Indexer) IndexAll(ctx context.Context) (*IndexStats, error) {
 	return idx.IndexAllWithProgress(ctx, nil)

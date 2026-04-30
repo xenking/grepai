@@ -24,7 +24,7 @@ func NewFromConfig(cfg *config.Config) (Embedder, error) {
 	case "openai":
 		opts := []OpenAIOption{
 			WithOpenAIModel(cfg.Embedder.Model),
-			WithOpenAIKey(cfg.Embedder.APIKey),
+			WithOpenAIKey(config.ResolveEmbedderAPIKey("openai", cfg.Embedder.APIKey)),
 			WithOpenAIEndpoint(cfg.Embedder.Endpoint),
 			WithOpenAIParallelism(cfg.Embedder.Parallelism),
 			WithOpenAIBatchConfig(batchConfigFromEmbedder(&cfg.Embedder)),
@@ -47,7 +47,7 @@ func NewFromConfig(cfg *config.Config) (Embedder, error) {
 	case "synthetic":
 		opts := []SyntheticOption{
 			WithSyntheticModel(cfg.Embedder.Model),
-			WithSyntheticKey(cfg.Embedder.APIKey),
+			WithSyntheticKey(config.ResolveEmbedderAPIKey("synthetic", cfg.Embedder.APIKey)),
 			WithSyntheticEndpoint(cfg.Embedder.Endpoint),
 		}
 		if cfg.Embedder.Dimensions != nil {
@@ -58,7 +58,7 @@ func NewFromConfig(cfg *config.Config) (Embedder, error) {
 	case "voyageai":
 		opts := []VoyageAIOption{
 			WithVoyageAIModel(cfg.Embedder.Model),
-			WithVoyageAIKey(cfg.Embedder.APIKey),
+			WithVoyageAIKey(config.ResolveEmbedderAPIKey("voyageai", cfg.Embedder.APIKey)),
 			WithVoyageAIEndpoint(cfg.Embedder.Endpoint),
 			WithVoyageAIParallelism(cfg.Embedder.Parallelism),
 			WithVoyageAIBatchConfig(batchConfigFromEmbedder(&cfg.Embedder)),
@@ -71,7 +71,7 @@ func NewFromConfig(cfg *config.Config) (Embedder, error) {
 	case "openrouter":
 		opts := []OpenRouterOption{
 			WithOpenRouterModel(cfg.Embedder.Model),
-			WithOpenRouterKey(cfg.Embedder.APIKey),
+			WithOpenRouterKey(config.ResolveEmbedderAPIKey("openrouter", cfg.Embedder.APIKey)),
 			WithOpenRouterEndpoint(cfg.Embedder.Endpoint),
 		}
 		if cfg.Embedder.Dimensions != nil {

@@ -16,11 +16,12 @@ import (
 )
 
 const (
-	ConfigDir           = ".grepai"
-	ConfigFileName      = "config.yaml"
-	IndexFileName       = "index.gob"
-	SymbolIndexFileName = "symbols.gob"
-	RPGIndexFileName    = "rpg.gob"
+	ConfigDir            = ".grepai"
+	ConfigFileName       = "config.yaml"
+	GlobalConfigFileName = "config.yaml"
+	IndexFileName        = "index.gob"
+	SymbolIndexFileName  = "symbols.gob"
+	RPGIndexFileName     = "rpg.gob"
 
 	DefaultEmbedderProvider         = "ollama"
 	DefaultOllamaEmbeddingModel     = "nomic-embed-text"
@@ -62,8 +63,62 @@ const (
 	DefaultWatchRPGPersistIntervalMs      = 1000
 	DefaultWatchRPGDerivedDebounceMs      = 300
 	DefaultWatchRPGFullReconcileIntervalS = 300
+	DefaultWatchReconcileIntervalS        = 300
 	DefaultWatchRPGMaxDirtyFilesPerBatch  = 128
 )
+
+// GlobalConfig holds user-level grepai settings stored in ~/.grepai/config.yaml.
+// It intentionally contains credentials/defaults that should not be copied into
+// per-project .grepai/config.yaml files.
+type GlobalConfig struct {
+	APIKeys map[string]string `yaml:"api_keys,omitempty"`
+}
+
+// GetGlobalConfigPath returns the path to the user-level grepai config file.
+func GetGlobalConfigPath() (string, error) {
+	globalDir, err := GetGlobalConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(globalDir, GlobalConfigFileName), nil
+}
+
+// LoadGlobalConfig loads ~/.grepai/config.yaml. A missing file is not an error.
+func LoadGlobalConfig() (*GlobalConfig, error) {
+	path, err := GetGlobalConfigPath()
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &GlobalConfig{}, nil
+		}
+		return nil, fmt.Errorf("read global config: %w", err)
+	}
+	var cfg GlobalConfig
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parse global config: %w", err)
+	}
+	return &cfg, nil
+}
+
+// ResolveEmbedderAPIKey returns an explicit project key when present, otherwise
+// falls back to ~/.grepai/config.yaml api_keys.<provider>. Values may reference
+// environment variables via ${NAME}.
+func ResolveEmbedderAPIKey(provider, projectKey string) string {
+	if key := strings.TrimSpace(os.ExpandEnv(projectKey)); key != "" {
+		return key
+	}
+	global, err := LoadGlobalConfig()
+	if err != nil || global == nil || len(global.APIKeys) == 0 {
+		return ""
+	}
+	if key := strings.TrimSpace(os.ExpandEnv(global.APIKeys[provider])); key != "" {
+		return key
+	}
+	return ""
+}
 
 type Config struct {
 	Version           int             `yaml:"version"`
@@ -351,6 +406,7 @@ type WatchConfig struct {
 	RPGPersistIntervalMs        int       `yaml:"rpg_persist_interval_ms,omitempty"`
 	RPGDerivedDebounceMs        int       `yaml:"rpg_derived_debounce_ms,omitempty"`
 	RPGFullReconcileIntervalSec int       `yaml:"rpg_full_reconcile_interval_sec,omitempty"`
+	ReconcileIntervalSec        int       `yaml:"reconcile_interval_sec,omitempty"`
 	RPGMaxDirtyFilesPerBatch    int       `yaml:"rpg_max_dirty_files_per_batch,omitempty"`
 }
 
@@ -408,6 +464,9 @@ func ValidateWatchConfig(cfg WatchConfig) error {
 	if cfg.RPGFullReconcileIntervalSec < 30 {
 		return fmt.Errorf("watch.rpg_full_reconcile_interval_sec must be >= 30, got %d", cfg.RPGFullReconcileIntervalSec)
 	}
+	if cfg.ReconcileIntervalSec != 0 && cfg.ReconcileIntervalSec < 30 {
+		return fmt.Errorf("watch.reconcile_interval_sec must be >= 30, got %d", cfg.ReconcileIntervalSec)
+	}
 	if cfg.RPGMaxDirtyFilesPerBatch < 1 {
 		return fmt.Errorf("watch.rpg_max_dirty_files_per_batch must be >= 1, got %d", cfg.RPGMaxDirtyFilesPerBatch)
 	}
@@ -439,6 +498,7 @@ func DefaultConfig() *Config {
 			RPGPersistIntervalMs:        DefaultWatchRPGPersistIntervalMs,
 			RPGDerivedDebounceMs:        DefaultWatchRPGDerivedDebounceMs,
 			RPGFullReconcileIntervalSec: DefaultWatchRPGFullReconcileIntervalS,
+			ReconcileIntervalSec:        DefaultWatchReconcileIntervalS,
 			RPGMaxDirtyFilesPerBatch:    DefaultWatchRPGMaxDirtyFilesPerBatch,
 		},
 		Search: SearchConfig{
@@ -794,6 +854,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Watch.RPGFullReconcileIntervalSec == 0 {
 		c.Watch.RPGFullReconcileIntervalSec = defaults.Watch.RPGFullReconcileIntervalSec
+	}
+	if c.Watch.ReconcileIntervalSec == 0 {
+		c.Watch.ReconcileIntervalSec = defaults.Watch.ReconcileIntervalSec
 	}
 	if c.Watch.RPGMaxDirtyFilesPerBatch == 0 {
 		c.Watch.RPGMaxDirtyFilesPerBatch = defaults.Watch.RPGMaxDirtyFilesPerBatch

@@ -3,6 +3,7 @@ package cli
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/yoanbernabeu/grepai/config"
@@ -135,7 +136,7 @@ func TestResolveMCPWorkspace(t *testing.T) {
 		}
 	})
 
-	t.Run("no_local_project_and_no_workspace_config_starts_unscoped", func(t *testing.T) {
+	t.Run("no_local_project_and_no_workspace_config_errors", func(t *testing.T) {
 		tmpDir, _ := os.MkdirTemp("", "grepai-mcp-test")
 		defer os.RemoveAll(tmpDir)
 		cleanup := setTestHomeDirCLI(t, tmpDir)
@@ -156,11 +157,11 @@ func TestResolveMCPWorkspace(t *testing.T) {
 		}
 
 		projectRoot, wsName, err := resolveMCPTarget("", "")
-		if err != nil {
-			t.Fatalf("expected unscoped startup, got error: %v", err)
+		if err == nil {
+			t.Fatalf("expected missing context error, got projectRoot=%q wsName=%q", projectRoot, wsName)
 		}
-		if projectRoot != "" || wsName != "" {
-			t.Fatalf("expected unscoped startup (\"\", \"\"), got (%q, %q)", projectRoot, wsName)
+		if !strings.Contains(err.Error(), "no grepai project or workspace found") {
+			t.Fatalf("expected missing context error, got: %v", err)
 		}
 	})
 }
