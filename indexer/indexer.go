@@ -28,6 +28,7 @@ type IndexStats struct {
 	FilesRemoved  int
 	Duration      time.Duration
 	ScannedFiles  []FileMeta // All files found during scan (for reuse by callers)
+	RemovedFiles  []string   // Files removed because they are no longer scan-visible
 }
 
 // ProgressInfo contains progress information for indexing
@@ -83,6 +84,17 @@ func NewIndexer(
 // scan/reconcile passes.
 func (idx *Indexer) SetLastIndexTime(t time.Time) {
 	idx.lastIndexTime = t
+}
+
+// SetScanner updates the scanner used by future full scans and file events.
+// Long-lived watchers call this after reloading ignore/config state.
+func (idx *Indexer) SetScanner(scanner *Scanner) {
+	idx.scanner = scanner
+}
+
+// SetProcessor updates the optional framework processor used for embedding.
+func (idx *Indexer) SetProcessor(processor *framework.ProcessorRegistry) {
+	idx.processor = processor
 }
 
 // IndexAll performs a full index of the project (no progress reporting)
@@ -218,6 +230,7 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 			continue
 		}
 		stats.FilesRemoved++
+		stats.RemovedFiles = append(stats.RemovedFiles, path)
 	}
 
 	stats.Duration = time.Since(start)

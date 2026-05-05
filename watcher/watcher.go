@@ -39,6 +39,7 @@ type Watcher struct {
 	root       string
 	watcher    *fsnotify.Watcher
 	ignore     *indexer.IgnoreMatcher
+	ignoreMu   sync.RWMutex
 	debounceMs int
 	events     chan FileEvent
 	done       chan struct{}
@@ -94,6 +95,30 @@ func (w *Watcher) Events() <-chan FileEvent {
 	return w.events
 }
 
+// SetIgnore swaps the ignore matcher used for future events. Watchers are
+// long-lived, while .grepai/config.yaml and .grepaiignore can change at
+// runtime; reconcile reloads call this so newly ignored paths stop emitting
+// events without requiring a daemon restart.
+func (w *Watcher) SetIgnore(ignore *indexer.IgnoreMatcher) {
+	w.ignoreMu.Lock()
+	w.ignore = ignore
+	w.ignoreMu.Unlock()
+}
+
+func (w *Watcher) shouldIgnore(path string) bool {
+	w.ignoreMu.RLock()
+	ignore := w.ignore
+	w.ignoreMu.RUnlock()
+	return ignore != nil && ignore.ShouldIgnore(path)
+}
+
+func (w *Watcher) shouldSkipDir(path string) bool {
+	w.ignoreMu.RLock()
+	ignore := w.ignore
+	w.ignoreMu.RUnlock()
+	return ignore != nil && ignore.ShouldSkipDir(path)
+}
+
 func (w *Watcher) Close() error {
 	close(w.done)
 	// Cancel any in-flight rewatch timers so we don't leak goroutines.
@@ -119,11 +144,11 @@ func (w *Watcher) addRecursive(root string) error {
 
 		// Handle directories: use ShouldSkipDir to respect .grepaiignore negations
 		if info.IsDir() {
-			if w.ignore.ShouldSkipDir(relPath) {
+			if w.shouldSkipDir(relPath) {
 				return filepath.SkipDir
 			}
 			// Directory is not skipped; watch it if not individually ignored
-			if !w.ignore.ShouldIgnore(relPath) {
+			if !w.shouldIgnore(relPath) {
 				if err := w.watcher.Add(path); err != nil {
 					log.Printf("Failed to watch %s: %v", path, err)
 				} else {
@@ -134,7 +159,7 @@ func (w *Watcher) addRecursive(root string) error {
 		}
 
 		// Skip ignored files
-		if w.ignore.ShouldIgnore(relPath) {
+		if w.shouldIgnore(relPath) {
 			return nil
 		}
 
@@ -258,7 +283,7 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 	if strings.HasPrefix(filepath.Base(relPath), ".") {
 		return
 	}
-	if w.ignore.ShouldIgnore(relPath) {
+	if w.shouldIgnore(relPath) {
 		return
 	}
 

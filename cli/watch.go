@@ -825,6 +825,11 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 	if err != nil {
 		return nil, fmt.Errorf("initial indexing failed: %w", err)
 	}
+	for _, removed := range stats.RemovedFiles {
+		if err := symbolStore.DeleteFile(ctx, removed); err != nil {
+			log.Printf("Warning: failed to remove symbols for %s: %v", removed, err)
+		}
+	}
 
 	if !isBackgroundChild {
 		fmt.Printf("Initial scan complete: %d files indexed, %d chunks created, %d files removed, %d skipped (took %s)\n",
@@ -980,6 +985,37 @@ func buildFrameworkRegistry(cfg *config.Config) *framework.ProcessorRegistry {
 	)
 }
 
+func watchTracedLanguages(cfg *config.Config) []string {
+	tracedLanguages := cfg.Trace.EnabledLanguages
+	if len(tracedLanguages) == 0 {
+		return []string{".go", ".js", ".ts", ".jsx", ".tsx", ".vue", ".py", ".php", ".lua", ".java", ".cs", ".fs", ".fsx", ".fsi"}
+	}
+	return tracedLanguages
+}
+
+func reloadWatchScanContext(projectRoot string, cfg *config.Config, idx *indexer.Indexer, w *watcher.Watcher) (*indexer.Scanner, []string, *framework.ProcessorRegistry, error) {
+	reloaded, err := config.Load(projectRoot)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to reload config: %w", err)
+	}
+
+	ignoreMatcher, err := indexer.NewIgnoreMatcher(projectRoot, reloaded.Ignore, reloaded.ExternalGitignore)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to reload ignore matcher: %w", err)
+	}
+
+	*cfg = *reloaded
+	scanner := indexer.NewScanner(projectRoot, ignoreMatcher)
+	processorRegistry := buildFrameworkRegistry(cfg)
+	idx.SetScanner(scanner)
+	idx.SetProcessor(processorRegistry)
+	if w != nil {
+		w.SetIgnore(ignoreMatcher)
+	}
+
+	return scanner, watchTracedLanguages(cfg), processorRegistry, nil
+}
+
 // watchProject runs the full watch lifecycle for a single project.
 // The embedder is shared across all projects to avoid duplicate connections.
 // If onReady is non-nil, it is called once after initial indexing and watcher start.
@@ -1078,10 +1114,7 @@ func watchProjectWithEventObserver(ctx context.Context, projectRoot string, emb 
 		defer rpgStore.Close()
 	}
 
-	tracedLanguages := cfg.Trace.EnabledLanguages
-	if len(tracedLanguages) == 0 {
-		tracedLanguages = []string{".go", ".js", ".ts", ".jsx", ".tsx", ".vue", ".py", ".php", ".lua", ".java", ".cs", ".fs", ".fsx", ".fsi"}
-	}
+	tracedLanguages := watchTracedLanguages(cfg)
 
 	// Signal ready BEFORE the initial scan (issue #218). A full scan on a large
 	// repository can easily exceed 30s; previously the parent CLI would time
@@ -1227,6 +1260,15 @@ func runProjectWatchLoop(ctx context.Context, st store.VectorStore, symbolStore 
 			}
 
 		case <-reconcileTicker.C:
+			reloadedScanner, reloadedLanguages, reloadedProcessor, err := reloadWatchScanContext(projectRoot, cfg, idx, w)
+			if err != nil {
+				log.Printf("Warning: periodic reconcile using existing watch config for %s: %v", projectRoot, err)
+			} else {
+				scanner = reloadedScanner
+				tracedLanguages = reloadedLanguages
+				processors = []*framework.ProcessorRegistry{reloadedProcessor}
+			}
+
 			stats, err := runInitialScan(ctx, idx, scanner, extractor, symbolStore, tracedLanguages, cfg.Watch.LastIndexTime, true, nil, nil, processors...)
 			if err != nil {
 				log.Printf("Warning: periodic reconcile failed for %s: %v", projectRoot, err)

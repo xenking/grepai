@@ -194,6 +194,68 @@ func TestRunInitialScan_SkipsIndexedFileByLastIndexTime(t *testing.T) {
 	}
 }
 
+func TestRunInitialScan_RemovesFilesAfterIgnoreReload(t *testing.T) {
+	ctx := context.Background()
+	projectRoot := t.TempDir()
+
+	ignoredDir := filepath.Join(projectRoot, ".omx")
+	if err := os.MkdirAll(ignoredDir, 0755); err != nil {
+		t.Fatalf("failed to create ignored dir: %v", err)
+	}
+	srcPath := filepath.Join(ignoredDir, "state.go")
+	srcContent := "package state\n\nfunc stale() {}\n"
+	if err := os.WriteFile(srcPath, []byte(srcContent), 0644); err != nil {
+		t.Fatalf("failed to create source file: %v", err)
+	}
+
+	initialIgnore, err := indexer.NewIgnoreMatcher(projectRoot, []string{}, "")
+	if err != nil {
+		t.Fatalf("failed to create initial ignore matcher: %v", err)
+	}
+	scanner := indexer.NewScanner(projectRoot, initialIgnore)
+	chunker := indexer.NewChunker(512, 50)
+	vecStore := store.NewGOBStore(filepath.Join(projectRoot, "index.gob"))
+	idx := indexer.NewIndexer(projectRoot, vecStore, &noOpEmbedder{}, chunker, scanner, time.Time{})
+	symbolStore := trace.NewGOBSymbolStore(filepath.Join(projectRoot, "symbols.gob"))
+	defer symbolStore.Close()
+	extractor := trace.NewRegexExtractor()
+
+	stats, err := runInitialScan(ctx, idx, scanner, extractor, symbolStore, []string{".go"}, time.Time{}, true, nil, nil)
+	if err != nil {
+		t.Fatalf("initial runInitialScan failed: %v", err)
+	}
+	if stats.FilesIndexed != 1 {
+		t.Fatalf("expected initial scan to index stale file, got %d indexed", stats.FilesIndexed)
+	}
+	if doc, err := vecStore.GetDocument(ctx, ".omx/state.go"); err != nil || doc == nil {
+		t.Fatalf("expected stale document before ignore reload, doc=%v err=%v", doc, err)
+	}
+	if symbols, err := symbolStore.LookupSymbol(ctx, "stale"); err != nil || len(symbols) == 0 {
+		t.Fatalf("expected stale symbol before ignore reload, symbols=%d err=%v", len(symbols), err)
+	}
+
+	reloadedIgnore, err := indexer.NewIgnoreMatcher(projectRoot, []string{".omx"}, "")
+	if err != nil {
+		t.Fatalf("failed to create reloaded ignore matcher: %v", err)
+	}
+	reloadedScanner := indexer.NewScanner(projectRoot, reloadedIgnore)
+	idx.SetScanner(reloadedScanner)
+
+	stats, err = runInitialScan(ctx, idx, reloadedScanner, extractor, symbolStore, []string{".go"}, time.Time{}, true, nil, nil)
+	if err != nil {
+		t.Fatalf("reload runInitialScan failed: %v", err)
+	}
+	if stats.FilesRemoved != 1 {
+		t.Fatalf("expected ignored stale file to be removed, got %d removed", stats.FilesRemoved)
+	}
+	if doc, err := vecStore.GetDocument(ctx, ".omx/state.go"); err != nil || doc != nil {
+		t.Fatalf("expected stale document removed after ignore reload, doc=%v err=%v", doc, err)
+	}
+	if symbols, err := symbolStore.LookupSymbol(ctx, "stale"); err != nil || len(symbols) != 0 {
+		t.Fatalf("expected stale symbol removed after ignore reload, symbols=%d err=%v", len(symbols), err)
+	}
+}
+
 func TestHandleFileEvent_SkipsUnchangedFile(t *testing.T) {
 	ctx := context.Background()
 	projectRoot := t.TempDir()
