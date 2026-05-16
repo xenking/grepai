@@ -135,11 +135,11 @@ func runWatch(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Workspace mode
+	// Workspace mode. pprof startup is deferred into
+	// runWorkspaceWatchForeground (the actual long-running entrypoint after
+	// --status/--stop/--background dispatch) so control commands and the
+	// short-lived background parent don't race on the listener port.
 	if watchWorkspace != "" {
-		if err := maybeStartPprofServer(); err != nil {
-			return err
-		}
 		return runWorkspaceWatch(logDir)
 	}
 
@@ -858,17 +858,26 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 	}
 
 	// Fast path: when reconcile (lastIndexTime non-zero) finds no embedding
-	// work AND every traced file is already represented in the symbol store,
-	// skip the symbol pass entirely. The pass below reads every traced file
-	// from disk to compute a hash — on large repos this costs hundreds of MB
-	// of churn per reconcile cycle for no behavioural change. Incremental
+	// work AND every traced file is already represented in the symbol store
+	// AND no traced file has been modified since the last index time, skip
+	// the symbol pass entirely. The pass below reads every traced file from
+	// disk to compute a hash — on large repos this costs hundreds of MB of
+	// churn per reconcile cycle for no behavioural change. Incremental
 	// symbol updates still happen via handleFileEvent.
 	//
-	// The IsFileIndexed check is required to keep symbol coverage in sync
-	// with the configured language set: if `trace.enabled_languages` is
-	// expanded at runtime, files in the newly-enabled languages will be
-	// absent from the symbol store and must still flow through the full
-	// pass so their symbols can be backfilled.
+	// Three guards together keep symbol coverage in sync with reality:
+	//
+	//  1. IsFileIndexed: if `trace.enabled_languages` is expanded at
+	//     runtime, files in the newly-enabled languages will be absent
+	//     from the symbol store and must flow through the full pass so
+	//     their symbols can be backfilled.
+	//
+	//  2. ModTime > lastIndexTime: embedding stats count only files that
+	//     produced chunks. A traced file that was modified to empty,
+	//     whitespace-only, or otherwise yielded zero chunks would not
+	//     bump FilesIndexed, but its symbol entry is still stale. Forcing
+	//     a full pass when any traced file's mtime is newer than the
+	//     watermark ensures `symbols.gob` reflects the latest contents.
 	if !lastIndexTime.IsZero() && stats.FilesIndexed == 0 && stats.FilesRemoved == 0 {
 		backfillNeeded := false
 		for _, file := range stats.ScannedFiles {
@@ -877,6 +886,10 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 				continue
 			}
 			if !symbolStore.IsFileIndexed(file.Path) {
+				backfillNeeded = true
+				break
+			}
+			if time.Unix(file.ModTime, 0).After(lastIndexTime) {
 				backfillNeeded = true
 				break
 			}
@@ -2660,10 +2673,15 @@ func startBackgroundWorkspaceWatch(logDir string, ws *config.Workspace) error {
 		return fmt.Errorf("workspace watcher %s is already running (PID %d)", ws.Name, pid)
 	}
 
-	// Build extra args
+	// Build extra args. --pprof-addr is forwarded so the diagnostic listener
+	// actually lives in the long-running workspace daemon rather than the
+	// short-lived parent process that just spawned it.
 	var extraArgs []string
 	if watchLogDir != "" {
 		extraArgs = append(extraArgs, "--log-dir", watchLogDir)
+	}
+	if addr := strings.TrimSpace(watchPprofAddr); addr != "" {
+		extraArgs = append(extraArgs, "--pprof-addr", addr)
 	}
 
 	// Spawn background process
@@ -2706,6 +2724,9 @@ func startBackgroundWorkspaceWatch(logDir string, ws *config.Workspace) error {
 }
 
 func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
+	if err := maybeStartPprofServer(); err != nil {
+		return err
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
