@@ -517,7 +517,7 @@ func defaultIgnorePatterns() []string {
 		".cache",
 		".eslintcache",
 		".stylelintcache",
-		".tsbuildinfo",
+		"*.tsbuildinfo",
 		".storybook-out",
 		"storybook-static",
 		".vercel",
