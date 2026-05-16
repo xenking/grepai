@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
+	"net/http"
+	_ "net/http/pprof" // exposes /debug/pprof when --pprof-addr is set
 	"os"
 	"os/exec"
 	"os/signal"
@@ -38,6 +41,7 @@ var (
 	watchWorkspace    string
 	watchNoUI         bool
 	watchReadyTimeout time.Duration
+	watchPprofAddr    string
 )
 
 // defaultWatchReadyTimeout is the default deadline for the parent CLI to wait
@@ -101,9 +105,21 @@ func init() {
 	watchCmd.Flags().BoolVar(&watchNoUI, "no-ui", false, "Disable interactive UI in foreground mode")
 	watchCmd.Flags().DurationVar(&watchReadyTimeout, "ready-timeout", defaultWatchReadyTimeout,
 		"How long the parent waits for a --background watcher to signal ready before giving up")
+	watchCmd.Flags().StringVar(&watchPprofAddr, "pprof-addr", "",
+		"If set (e.g. 127.0.0.1:6060), start a net/http/pprof server on that address for heap/goroutine introspection")
 }
 
 func runWatch(cmd *cobra.Command, args []string) error {
+	// Optional diagnostic endpoint. Bind to a loopback address before any
+	// heavy work so heap / goroutine snapshots can be captured even if the
+	// daemon hangs later. The blank import of net/http/pprof registers the
+	// /debug/pprof/* handlers on http.DefaultServeMux.
+	if addr := strings.TrimSpace(watchPprofAddr); addr != "" {
+		if err := startPprofServer(addr); err != nil {
+			return fmt.Errorf("failed to start pprof server on %s: %w", addr, err)
+		}
+	}
+
 	// Validate mutually exclusive flags
 	activeFlags := 0
 	if watchBackground {
@@ -837,6 +853,19 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 	} else {
 		log.Printf("Initial scan complete: %d files indexed, %d chunks created, %d files removed, %d skipped (took %s)",
 			stats.FilesIndexed, stats.ChunksCreated, stats.FilesRemoved, stats.FilesSkipped, stats.Duration.Round(time.Millisecond))
+	}
+
+	// Fast path: when reconcile (lastIndexTime non-zero) finds no embedding
+	// work, skip the symbol pass entirely. The pass below reads every traced
+	// file from disk to compute a hash — on large repos this costs hundreds of
+	// MB of churn per reconcile cycle for no behavioural change. Incremental
+	// symbol updates still happen via handleFileEvent.
+	if !lastIndexTime.IsZero() && stats.FilesIndexed == 0 && stats.FilesRemoved == 0 {
+		if isBackgroundChild {
+			log.Printf("Symbol index unchanged: skipped (no files indexed or removed)")
+		}
+		stats.ScannedFiles = nil
+		return stats, nil
 	}
 
 	// Index symbols for traced languages
@@ -3138,4 +3167,28 @@ func (p *projectPrefixStore) GetChunksForFile(ctx context.Context, filePath stri
 
 func (p *projectPrefixStore) GetAllChunks(ctx context.Context) ([]store.Chunk, error) {
 	return p.store.GetAllChunks(ctx)
+}
+
+// startPprofServer binds the default net/http/pprof mux on addr in a
+// background goroutine. The blank import of net/http/pprof in this package
+// registers the /debug/pprof/* handlers on http.DefaultServeMux at init time;
+// this function just exposes them on the chosen TCP address. The listener is
+// created synchronously so we can fail fast on a port conflict — typical
+// usage is a loopback address (127.0.0.1:NNNN) reserved per watcher.
+func startPprofServer(addr string) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	srv := &http.Server{
+		Handler:           http.DefaultServeMux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	go func() {
+		log.Printf("pprof listening on http://%s/debug/pprof/", ln.Addr().String())
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("pprof server stopped: %v", err)
+		}
+	}()
+	return nil
 }

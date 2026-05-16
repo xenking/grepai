@@ -473,6 +473,155 @@ func ValidateWatchConfig(cfg WatchConfig) error {
 	return nil
 }
 
+// defaultIgnorePatterns returns the default ignore list applied to new
+// projects. It intentionally covers a wide range of build artifacts, caches,
+// lockfiles, and binary assets that have no semantic value for code search
+// but would otherwise be re-scanned on every reconcile, triggering needless
+// embedding work and inflating watcher memory.
+func defaultIgnorePatterns() []string {
+	return []string{
+		// VCS / IDE
+		".git",
+		".hg",
+		".svn",
+		".idea",
+		".vscode",
+		".fleet",
+		".zed",
+
+		// grepai + sibling tool indices
+		".grepai",
+		".graphify",
+		".omx",
+
+		// Generic build / output
+		"bin",
+		"obj",
+		"dist",
+		"out",
+		"build",
+		"target",
+		"public/build",
+		"public/downloads",
+
+		// JS/TS ecosystems
+		"node_modules",
+		".next",
+		".nuxt",
+		".svelte-kit",
+		".astro",
+		".turbo",
+		".parcel-cache",
+		".rollup.cache",
+		".webpack",
+		".cache",
+		".eslintcache",
+		".stylelintcache",
+		".tsbuildinfo",
+		".storybook-out",
+		"storybook-static",
+		".vercel",
+		".netlify",
+
+		// Test / coverage
+		"coverage",
+		".coverage",
+		".nyc_output",
+		"test-results",
+		"playwright-report",
+		".playwright",
+		"junit.xml",
+
+		// Python
+		"__pycache__",
+		".pytest_cache",
+		".mypy_cache",
+		".ruff_cache",
+		".tox",
+		".venv",
+		"venv",
+		".eggs",
+		"*.egg-info",
+
+		// Rust / Zig / Go / Java / Kotlin
+		".zig-cache",
+		"zig-out",
+		".gradle",
+		".kotlin",
+
+		// Native / language servers
+		"vendor",
+		"Pods",
+		"DerivedData",
+
+		// Vector store / runtime
+		"qdrant_storage",
+
+		// Lockfiles (no semantic content; mtime churns on installs)
+		"pnpm-lock.yaml",
+		"yarn.lock",
+		"package-lock.json",
+		"bun.lockb",
+		"Cargo.lock",
+		"poetry.lock",
+		"composer.lock",
+		"Gemfile.lock",
+		"go.sum",
+
+		// Fonts / images / media (unsupported extensions, but listed
+		// so directory walks short-circuit and fsnotify watches stay tight)
+		"*.woff",
+		"*.woff2",
+		"*.ttf",
+		"*.otf",
+		"*.eot",
+		"*.png",
+		"*.jpg",
+		"*.jpeg",
+		"*.gif",
+		"*.webp",
+		"*.ico",
+		"*.svg",
+		"*.mp4",
+		"*.mov",
+		"*.webm",
+		"*.mp3",
+		"*.wav",
+
+		// Archives / binaries
+		"*.zip",
+		"*.tar",
+		"*.tar.gz",
+		"*.tgz",
+		"*.tar.bz2",
+		"*.7z",
+		"*.rar",
+		"*.dmg",
+		"*.pkg",
+		"*.deb",
+		"*.rpm",
+		"*.exe",
+		"*.dll",
+		"*.so",
+		"*.dylib",
+		"*.a",
+		"*.o",
+		"*.class",
+		"*.jar",
+		"*.war",
+		"*.wasm",
+
+		// Logs / OS junk / editor backups
+		"*.log",
+		".DS_Store",
+		"Thumbs.db",
+		"desktop.ini",
+		"*.swp",
+		"*.swo",
+		"*~",
+	}
+}
+
 func DefaultConfig() *Config {
 	return &Config{
 		Version:  1,
@@ -576,23 +725,7 @@ func DefaultConfig() *Config {
 		Update: UpdateConfig{
 			CheckOnStartup: false, // Opt-in by default for privacy
 		},
-		Ignore: []string{
-			".git",
-			".grepai",
-			"node_modules",
-			"vendor",
-			"bin",
-			"dist",
-			"__pycache__",
-			".venv",
-			"venv",
-			".idea",
-			".vscode",
-			"target",
-			".zig-cache",
-			"zig-out",
-			"qdrant_storage",
-		},
+		Ignore: defaultIgnorePatterns(),
 	}
 }
 
