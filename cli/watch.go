@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
+	"net/http"
+	_ "net/http/pprof" // exposes /debug/pprof when --pprof-addr is set
 	"os"
 	"os/exec"
 	"os/signal"
@@ -38,6 +41,7 @@ var (
 	watchWorkspace    string
 	watchNoUI         bool
 	watchReadyTimeout time.Duration
+	watchPprofAddr    string
 )
 
 // defaultWatchReadyTimeout is the default deadline for the parent CLI to wait
@@ -101,6 +105,8 @@ func init() {
 	watchCmd.Flags().BoolVar(&watchNoUI, "no-ui", false, "Disable interactive UI in foreground mode")
 	watchCmd.Flags().DurationVar(&watchReadyTimeout, "ready-timeout", defaultWatchReadyTimeout,
 		"How long the parent waits for a --background watcher to signal ready before giving up")
+	watchCmd.Flags().StringVar(&watchPprofAddr, "pprof-addr", "",
+		"If set (e.g. 127.0.0.1:6060), start a net/http/pprof server on that address for heap/goroutine introspection")
 }
 
 func runWatch(cmd *cobra.Command, args []string) error {
@@ -129,7 +135,10 @@ func runWatch(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Workspace mode
+	// Workspace mode. pprof startup is deferred into
+	// runWorkspaceWatchForeground (the actual long-running entrypoint after
+	// --status/--stop/--background dispatch) so control commands and the
+	// short-lived background parent don't race on the listener port.
 	if watchWorkspace != "" {
 		return runWorkspaceWatch(logDir)
 	}
@@ -201,6 +210,10 @@ func runWatch(cmd *cobra.Command, args []string) error {
 	}
 	if pid > 0 {
 		return fmt.Errorf("watcher is already running in background (PID %d)\nUse 'grepai watch --stop' to stop it", pid)
+	}
+
+	if err := maybeStartPprofServer(); err != nil {
+		return err
 	}
 
 	if watchUseUISelector(
@@ -365,10 +378,15 @@ func startBackgroundWatch(logDir, worktreeID string) error {
 		return fmt.Errorf("watcher is already running (PID %d)", pid)
 	}
 
-	// Build args for background process (exclude --background flag)
+	// Build args for background process (exclude --background flag).
+	// --pprof-addr is forwarded so the diagnostic endpoint actually lives in
+	// the long-running child rather than the short-lived launcher.
 	args := []string{"watch"}
 	if watchLogDir != "" {
 		args = append(args, "--log-dir", watchLogDir)
+	}
+	if addr := strings.TrimSpace(watchPprofAddr); addr != "" {
+		args = append(args, "--pprof-addr", addr)
 	}
 
 	// Spawn background process
@@ -837,6 +855,52 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 	} else {
 		log.Printf("Initial scan complete: %d files indexed, %d chunks created, %d files removed, %d skipped (took %s)",
 			stats.FilesIndexed, stats.ChunksCreated, stats.FilesRemoved, stats.FilesSkipped, stats.Duration.Round(time.Millisecond))
+	}
+
+	// Fast path: when reconcile (lastIndexTime non-zero) finds no embedding
+	// work AND every traced file is already represented in the symbol store
+	// AND no traced file has been modified since the last index time, skip
+	// the symbol pass entirely. The pass below reads every traced file from
+	// disk to compute a hash — on large repos this costs hundreds of MB of
+	// churn per reconcile cycle for no behavioural change. Incremental
+	// symbol updates still happen via handleFileEvent.
+	//
+	// Three guards together keep symbol coverage in sync with reality:
+	//
+	//  1. IsFileIndexed: if `trace.enabled_languages` is expanded at
+	//     runtime, files in the newly-enabled languages will be absent
+	//     from the symbol store and must flow through the full pass so
+	//     their symbols can be backfilled.
+	//
+	//  2. ModTime > lastIndexTime: embedding stats count only files that
+	//     produced chunks. A traced file that was modified to empty,
+	//     whitespace-only, or otherwise yielded zero chunks would not
+	//     bump FilesIndexed, but its symbol entry is still stale. Forcing
+	//     a full pass when any traced file's mtime is newer than the
+	//     watermark ensures `symbols.gob` reflects the latest contents.
+	if !lastIndexTime.IsZero() && stats.FilesIndexed == 0 && stats.FilesRemoved == 0 {
+		backfillNeeded := false
+		for _, file := range stats.ScannedFiles {
+			ext := strings.ToLower(filepath.Ext(file.Path))
+			if !isTracedLanguage(ext, tracedLanguages) {
+				continue
+			}
+			if !symbolStore.IsFileIndexed(file.Path) {
+				backfillNeeded = true
+				break
+			}
+			if time.Unix(file.ModTime, 0).After(lastIndexTime) {
+				backfillNeeded = true
+				break
+			}
+		}
+		if !backfillNeeded {
+			if isBackgroundChild {
+				log.Printf("Symbol index unchanged: skipped (no files indexed or removed)")
+			}
+			stats.ScannedFiles = nil
+			return stats, nil
+		}
 	}
 
 	// Index symbols for traced languages
@@ -2609,10 +2673,15 @@ func startBackgroundWorkspaceWatch(logDir string, ws *config.Workspace) error {
 		return fmt.Errorf("workspace watcher %s is already running (PID %d)", ws.Name, pid)
 	}
 
-	// Build extra args
+	// Build extra args. --pprof-addr is forwarded so the diagnostic listener
+	// actually lives in the long-running workspace daemon rather than the
+	// short-lived parent process that just spawned it.
 	var extraArgs []string
 	if watchLogDir != "" {
 		extraArgs = append(extraArgs, "--log-dir", watchLogDir)
+	}
+	if addr := strings.TrimSpace(watchPprofAddr); addr != "" {
+		extraArgs = append(extraArgs, "--pprof-addr", addr)
 	}
 
 	// Spawn background process
@@ -2655,6 +2724,9 @@ func startBackgroundWorkspaceWatch(logDir string, ws *config.Workspace) error {
 }
 
 func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
+	if err := maybeStartPprofServer(); err != nil {
+		return err
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -3138,4 +3210,45 @@ func (p *projectPrefixStore) GetChunksForFile(ctx context.Context, filePath stri
 
 func (p *projectPrefixStore) GetAllChunks(ctx context.Context) ([]store.Chunk, error) {
 	return p.store.GetAllChunks(ctx)
+}
+
+// maybeStartPprofServer reads the global --pprof-addr flag and, if set,
+// boots the diagnostic endpoint. Centralised so that control commands
+// (--status, --stop) and the parent of a --background spawn don't accidentally
+// fail with a port-bind error before they've decided whether the long-lived
+// watcher is even going to run. Daemon children inherit the flag via
+// startBackgroundWatch's arg propagation, not via this function.
+func maybeStartPprofServer() error {
+	addr := strings.TrimSpace(watchPprofAddr)
+	if addr == "" {
+		return nil
+	}
+	if err := startPprofServer(addr); err != nil {
+		return fmt.Errorf("failed to start pprof server on %s: %w", addr, err)
+	}
+	return nil
+}
+
+// startPprofServer binds the default net/http/pprof mux on addr in a
+// background goroutine. The blank import of net/http/pprof in this package
+// registers the /debug/pprof/* handlers on http.DefaultServeMux at init time;
+// this function just exposes them on the chosen TCP address. The listener is
+// created synchronously so we can fail fast on a port conflict — typical
+// usage is a loopback address (127.0.0.1:NNNN) reserved per watcher.
+func startPprofServer(addr string) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	srv := &http.Server{
+		Handler:           http.DefaultServeMux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	go func() {
+		log.Printf("pprof listening on http://%s/debug/pprof/", ln.Addr().String())
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("pprof server stopped: %v", err)
+		}
+	}()
+	return nil
 }
